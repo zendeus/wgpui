@@ -307,10 +307,6 @@ fn run_example() {
     let app = gpui_platform::single_threaded_web();
 
     app.run(move |cx: &mut App| {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            cx.set_http_client(Arc::new(native_http::UreqHttpClient::new()));
-        }
         #[cfg(target_family = "wasm")]
         {
             // Safety: the web examples run single-threaded; the client is

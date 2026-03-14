@@ -1,6 +1,6 @@
 use crate::{
     BoolExt, MacDispatcher, MacDisplay, MacKeyboardLayout, MacKeyboardMapper, MacWindow,
-    events::key_to_native, ns_string, pasteboard::Pasteboard, renderer,
+    events::key_to_native, ns_string, pasteboard::Pasteboard,
 };
 use anyhow::{Context as _, anyhow};
 use block::ConcreteBlock;
@@ -161,7 +161,7 @@ pub(crate) struct MacPlatformState {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
-    renderer_context: renderer::Context,
+    gpu_context: gpui_wgpu::GpuContext,
     headless: bool,
     general_pasteboard: Pasteboard,
     find_pasteboard: Pasteboard,
@@ -198,7 +198,7 @@ impl MacPlatform {
             text_system,
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
-            renderer_context: renderer::Context::default(),
+            gpu_context: std::rc::Rc::new(std::cell::RefCell::new(None)),
             general_pasteboard: Pasteboard::general(),
             find_pasteboard: Pasteboard::find(),
             reopen: None,
@@ -611,13 +611,13 @@ impl Platform for MacPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        let renderer_context = self.0.lock().renderer_context.clone();
+        let gpu_context = self.0.lock().gpu_context.clone();
         Ok(Box::new(MacWindow::open(
             handle,
             options,
             self.foreground_executor(),
             self.background_executor(),
-            renderer_context,
+            gpu_context,
         )))
     }
 

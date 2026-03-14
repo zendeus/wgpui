@@ -207,13 +207,11 @@ impl WindowsWindowInner {
         let new_logical_size = device_size.to_pixels(scale_factor);
 
         self.state.logical_size.set(new_logical_size);
-        if should_resize_renderer
-            && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
-        {
-            log::error!("Failed to resize renderer, invalidating devices: {}", e);
+        if should_resize_renderer {
             self.state
-                .invalidate_devices
-                .store(true, std::sync::atomic::Ordering::Release);
+                .renderer
+                .borrow_mut()
+                .update_drawable_size(device_size);
         }
         if let Some(mut callback) = self.state.callbacks.resize.take() {
             callback(new_logical_size, scale_factor);
@@ -1125,17 +1123,8 @@ impl WindowsWindowInner {
         None
     }
 
-    fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
-        let devices = lparam.0 as *const DirectXDevices;
-        let devices = unsafe { &*devices };
-        if let Err(err) = self
-            .state
-            .renderer
-            .borrow_mut()
-            .handle_device_lost(&devices)
-        {
-            panic!("Device lost: {err}");
-        }
+    fn handle_device_lost(&self, _lparam: LPARAM) -> Option<isize> {
+        // wgpu handles device lost internally via device_lost callback
         Some(0)
     }
 
@@ -1143,10 +1132,6 @@ impl WindowsWindowInner {
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
         let mut request_frame = self.state.callbacks.request_frame.take()?;
 
-        // we are instructing gpui to force render a frame, this will
-        // re-populate all the gpu textures for us so we can resume drawing in
-        // case we disabled drawing earlier due to a device loss
-        self.state.renderer.borrow_mut().mark_drawable();
         request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render,

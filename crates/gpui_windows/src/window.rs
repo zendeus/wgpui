@@ -58,7 +58,8 @@ pub struct WindowsWindowState {
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
 
-    pub renderer: RefCell<DirectXRenderer>,
+    pub renderer: RefCell<gpui_wgpu::WgpuRenderer>,
+    pub gpu_context: gpui_wgpu::GpuContext,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -88,10 +89,38 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) parent_hwnd: Option<HWND>,
 }
 
+struct RawWindow {
+    hwnd: isize,
+}
+
+unsafe impl Send for RawWindow {}
+unsafe impl Sync for RawWindow {}
+
+impl raw_window_handle::HasWindowHandle for RawWindow {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        let handle = raw_window_handle::Win32WindowHandle::new(
+            std::num::NonZeroIsize::new(self.hwnd).unwrap(),
+        );
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(handle.into()) })
+    }
+}
+
+impl raw_window_handle::HasDisplayHandle for RawWindow {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        let handle = raw_window_handle::WindowsDisplayHandle::new();
+        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(handle.into()) })
+    }
+}
+
 impl WindowsWindowState {
     fn new(
         hwnd: HWND,
         directx_devices: &DirectXDevices,
+        gpu_context: gpui_wgpu::GpuContext,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
         display: WindowsDisplay,
@@ -118,8 +147,20 @@ impl WindowsWindowState {
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
-        let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
-            .context("Creating DirectX renderer")?;
+        let raw_window = RawWindow {
+            hwnd: hwnd.0 as isize,
+        };
+        let device_size = size(
+            DevicePixels(window_params.cx),
+            DevicePixels(window_params.cy),
+        );
+        let config = gpui_wgpu::WgpuSurfaceConfig {
+            size: device_size,
+            transparent: !disable_direct_composition,
+        };
+        let renderer =
+            gpui_wgpu::WgpuRenderer::new(gpu_context.clone(), &raw_window, config, None)
+                .context("Creating WgpuRenderer")?;
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;
@@ -149,6 +190,7 @@ impl WindowsWindowState {
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
+            gpu_context,
             click_state,
             current_cursor: Cell::new(current_cursor),
             nc_button_pressed: Cell::new(nc_button_pressed),
@@ -224,6 +266,7 @@ impl WindowsWindowInner {
         let state = WindowsWindowState::new(
             hwnd,
             &context.directx_devices,
+            context.gpu_context.clone(),
             cs,
             context.current_cursor,
             context.display,
@@ -374,6 +417,7 @@ struct WindowCreateContext {
     directx_devices: DirectXDevices,
     invalidate_devices: Arc<AtomicBool>,
     parent_hwnd: Option<HWND>,
+    gpu_context: gpui_wgpu::GpuContext,
 }
 
 impl WindowsWindow {
@@ -393,6 +437,7 @@ impl WindowsWindow {
             disable_direct_composition,
             directx_devices,
             invalidate_devices,
+            gpu_context,
         } = creation_info;
         register_window_class(icon);
         let parent_hwnd = if params.kind == WindowKind::Dialog {
@@ -474,6 +519,7 @@ impl WindowsWindow {
             directx_devices,
             invalidate_devices,
             parent_hwnd,
+            gpu_context,
         };
         let creation_result = unsafe {
             CreateWindowExW(
@@ -915,15 +961,11 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        self.state
-            .renderer
-            .borrow_mut()
-            .draw(scene, self.state.background_appearance.get())
-            .log_err();
+        self.state.renderer.borrow_mut().draw(scene);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        self.state.renderer.borrow().sprite_atlas()
+        self.state.renderer.borrow().sprite_atlas().clone()
     }
 
     fn get_raw_handle(&self) -> HWND {
@@ -931,7 +973,7 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        self.state.renderer.borrow().gpu_specs().log_err()
+        Some(self.state.renderer.borrow().gpu_specs())
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {

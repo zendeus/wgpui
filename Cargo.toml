@@ -54,8 +54,8 @@ nonminimal_bool = "allow"
 gpui = { path = "crates/gpui", default-features = false }
 gpui_macros = { path = "crates/gpui_macros" }
 gpui_util = { path = "crates/gpui_util" }
-gpui_platform = { path = "crates/gpui_platform", default-features = false }
-gpui_macos = { path = "crates/gpui_macos", default-features = false }
+gpui_platform = { path = "crates/gpui_platform", default-features = false, features = ["runtime_shaders"] }
+gpui_macos = { path = "crates/gpui_macos", default-features = false, features = ["runtime_shaders"] }
 gpui_linux = { path = "crates/gpui_linux", default-features = false }
 gpui_windows = { path = "crates/gpui_windows", default-features = false }
 gpui_web = { path = "crates/gpui_web" }

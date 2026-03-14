@@ -72,23 +72,7 @@
 
         # macOS-specific dependencies
         darwinBuildInputs = with pkgs; [
-          darwin.apple_sdk.frameworks.AppKit
-          darwin.apple_sdk.frameworks.CoreFoundation
-          darwin.apple_sdk.frameworks.CoreGraphics
-          darwin.apple_sdk.frameworks.CoreText
-          darwin.apple_sdk.frameworks.CoreVideo
-          darwin.apple_sdk.frameworks.Foundation
-          darwin.apple_sdk.frameworks.IOKit
-          darwin.apple_sdk.frameworks.Metal
-          darwin.apple_sdk.frameworks.MetalPerformanceShaders
-          darwin.apple_sdk.frameworks.QuartzCore
-          darwin.apple_sdk.frameworks.Security
-          darwin.apple_sdk.frameworks.SystemConfiguration
-          darwin.apple_sdk.frameworks.VideoToolbox
-          darwin.apple_sdk.frameworks.CoreMedia
-          darwin.apple_sdk.frameworks.CoreAudio
-          darwin.apple_sdk.frameworks.AudioToolbox
-          darwin.apple_sdk.frameworks.ScreenCaptureKit
+          apple-sdk_15
           libiconv
         ];
 
@@ -123,6 +107,9 @@
 
             RUST_BACKTRACE = 1;
           } // linuxEnvVars
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
+            MACOSX_DEPLOYMENT_TARGET = "10.15";
+          }
         );
       }
     );

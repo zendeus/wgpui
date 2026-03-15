@@ -9,6 +9,61 @@ use gpui::{
 };
 use std::{collections::HashMap, sync::Arc};
 
+#[cfg(not(target_family = "wasm"))]
+mod native_http {
+    use futures::future::BoxFuture;
+    use http_client::{AsyncBody, HttpClient, Response, StatusCode, Url};
+
+    pub struct UreqHttpClient {
+        agent: ureq::Agent,
+    }
+
+    impl UreqHttpClient {
+        pub fn new() -> Self {
+            Self {
+                agent: ureq::Agent::new_with_defaults(),
+            }
+        }
+    }
+
+    impl HttpClient for UreqHttpClient {
+        fn user_agent(&self) -> Option<&http_client::http::HeaderValue> {
+            None
+        }
+
+        fn proxy(&self) -> Option<&Url> {
+            None
+        }
+
+        fn send(
+            &self,
+            req: http_client::http::Request<AsyncBody>,
+        ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+            let (parts, _body) = req.into_parts();
+            let uri = parts.uri.to_string();
+
+            let result = self
+                .agent
+                .get(&uri)
+                .call()
+                .map_err(|e| anyhow::anyhow!("{e}"));
+
+            Box::pin(async move {
+                let response = result?;
+                let status = StatusCode::from_u16(response.status().as_u16())?;
+                let body_bytes: Vec<u8> = response
+                    .into_body()
+                    .read_to_vec()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let http_response = http_client::http::Response::builder()
+                    .status(status)
+                    .body(AsyncBody::from(body_bytes))?;
+                Ok(http_response)
+            })
+        }
+    }
+}
+
 const IMAGES_IN_GALLERY: usize = 30;
 
 struct ImageGallery {
@@ -252,6 +307,10 @@ fn run_example() {
     let app = gpui_platform::single_threaded_web();
 
     app.run(move |cx: &mut App| {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            cx.set_http_client(Arc::new(native_http::UreqHttpClient::new()));
+        }
         #[cfg(target_family = "wasm")]
         {
             // Safety: the web examples run single-threaded; the client is

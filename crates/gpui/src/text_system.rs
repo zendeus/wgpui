@@ -88,6 +88,11 @@ impl TextSystem {
         }
     }
 
+    /// Access the underlying platform text system for direct glyph rasterization.
+    pub fn platform_text_system(&self) -> &Arc<dyn PlatformTextSystem> {
+        &self.platform_text_system
+    }
+
     /// Get a list of all available font names from the operating system.
     pub fn all_font_names(&self) -> Vec<String> {
         let mut names = self.platform_text_system.all_font_names();

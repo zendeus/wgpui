@@ -1641,6 +1641,11 @@ impl Window {
         &self.text_system
     }
 
+    /// Access the sprite atlas used by this window for glyph caching.
+    pub fn sprite_atlas(&self) -> &Arc<dyn PlatformAtlas> {
+        &self.sprite_atlas
+    }
+
     /// The current text style. Which is composed of all the style refinements provided to `with_text_style`.
     pub fn text_style(&self) -> TextStyle {
         let mut style = TextStyle::default();

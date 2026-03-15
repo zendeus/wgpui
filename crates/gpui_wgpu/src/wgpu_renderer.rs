@@ -30,6 +30,8 @@ pub struct GpuCanvasContext<'a> {
     pub size: Size<DevicePixels>,
     /// The display scale factor.
     pub scale_factor: f32,
+    /// The sprite atlas for glyph texture lookups.
+    pub atlas: &'a WgpuAtlas,
 }
 
 /// Concrete callback type for gpu_canvas elements.
@@ -1833,6 +1835,7 @@ impl WgpuRenderer {
                         height: DevicePixels(height as i32),
                     },
                     scale_factor: 1.0,
+                    atlas: &self.atlas,
                 };
                 callback(&mut context);
             }

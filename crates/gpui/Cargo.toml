@@ -141,6 +141,8 @@ unicode-segmentation.workspace = true
 gpui_util = { workspace = true }
 proptest = { workspace = true }
 
+ureq = "3"
+
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 http_client = { workspace = true, features = ["test-support"] }
 

@@ -448,26 +448,28 @@ impl Render for DrawingApp {
             .bg(rgb(0xffffff))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
                     this.active_stroke = Some(vec![StrokePoint {
                         pos: [f32::from(event.position.x), f32::from(event.position.y)],
                         half_width: half_width_from_pressure(this.current_pressure),
                     }]);
+                    cx.notify();
                 }),
             )
             .on_mouse_move(cx.listener(
-                |this, event: &MouseMoveEvent, _window, _cx| {
+                |this, event: &MouseMoveEvent, _window, cx| {
                     if let Some(ref mut stroke) = this.active_stroke {
                         stroke.push(StrokePoint {
                             pos: [f32::from(event.position.x), f32::from(event.position.y)],
                             half_width: half_width_from_pressure(this.current_pressure),
                         });
+                        cx.notify();
                     }
                 },
             ))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
                     let _ = event;
                     if let Some(stroke) = this.active_stroke.take() {
                         let mut new_cached = (*this.cached_verts).clone();
@@ -477,6 +479,7 @@ impl Render for DrawingApp {
                         this.active_verts = Arc::new(Vec::new());
                     }
                     this.current_pressure = 0.0;
+                    cx.notify();
                 }),
             )
             .on_mouse_pressure(cx.listener(

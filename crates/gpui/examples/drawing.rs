@@ -33,9 +33,8 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
     let x = vertices[vi * 2u];
     let y = vertices[vi * 2u + 1u];
 
-    // Convert from logical pixels to device pixels, then to NDC
-    let device_pos = vec2<f32>(x, y) * uniforms.scale_factor;
-    let ndc = device_pos / uniforms.viewport_size * 2.0 - 1.0;
+    // Vertices are already in device pixels, convert to NDC
+    let ndc = vec2<f32>(x, y) / uniforms.viewport_size * 2.0 - 1.0;
     return vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
 }
 
@@ -188,11 +187,13 @@ struct DrawingApp {
     active_stroke: Option<Vec<StrokePoint>>,
     active_verts: Arc<Vec<f32>>,
     current_pressure: f32,
+    scale_factor: f32,
     gpu_state: Arc<Mutex<GpuState>>,
 }
 
 impl Render for DrawingApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.scale_factor = window.scale_factor();
         if let Some(ref active) = self.active_stroke {
             self.active_verts = Arc::new(tessellate_stroke(active));
         } else if !self.active_verts.is_empty() {
@@ -449,9 +450,10 @@ impl Render for DrawingApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    let s = this.scale_factor;
                     this.active_stroke = Some(vec![StrokePoint {
-                        pos: [f32::from(event.position.x), f32::from(event.position.y)],
-                        half_width: half_width_from_pressure(this.current_pressure),
+                        pos: [f32::from(event.position.x) * s, f32::from(event.position.y) * s],
+                        half_width: half_width_from_pressure(this.current_pressure) * s,
                     }]);
                     cx.notify();
                 }),
@@ -459,9 +461,10 @@ impl Render for DrawingApp {
             .on_mouse_move(cx.listener(
                 |this, event: &MouseMoveEvent, _window, cx| {
                     if let Some(ref mut stroke) = this.active_stroke {
+                        let s = this.scale_factor;
                         stroke.push(StrokePoint {
-                            pos: [f32::from(event.position.x), f32::from(event.position.y)],
-                            half_width: half_width_from_pressure(this.current_pressure),
+                            pos: [f32::from(event.position.x) * s, f32::from(event.position.y) * s],
+                            half_width: half_width_from_pressure(this.current_pressure) * s,
                         });
                         cx.notify();
                     }
@@ -507,6 +510,7 @@ fn main() {
                     active_stroke: None,
                     active_verts: Arc::new(Vec::new()),
                     current_pressure: 0.0,
+                    scale_factor: 1.0,
                     gpu_state: Arc::new(Mutex::new(GpuState {
                         pipeline: None,
                         bind_group_layout: None,

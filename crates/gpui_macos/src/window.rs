@@ -1,7 +1,8 @@
 use crate::{
     BoolExt, DisplayLink, MacDisplay, NSRange, NSStringExt, events::platform_input_from_native,
-    ns_string, renderer,
+    ns_string,
 };
+use gpui_wgpu::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
 #[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block::ConcreteBlock;
@@ -47,6 +48,7 @@ use objc::{
 use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
+use gpui::DevicePixels;
 use std::{
     cell::Cell,
     ffi::{CStr, c_void},
@@ -58,6 +60,31 @@ use std::{
     sync::{Arc, Weak},
     time::Duration,
 };
+
+/// A helper struct implementing raw_window_handle traits for passing to wgpu.
+struct RawWindow {
+    ns_view: NonNull<c_void>,
+}
+
+// Safety: The raw pointers in RawWindow point to an NSView which is valid for
+// the window's lifetime. These are used only for passing to wgpu which needs
+// Send+Sync for surface creation.
+unsafe impl Send for RawWindow {}
+unsafe impl Sync for RawWindow {}
+
+impl rwh::HasWindowHandle for RawWindow {
+    fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
+        let handle = rwh::AppKitWindowHandle::new(self.ns_view);
+        Ok(unsafe { rwh::WindowHandle::borrow_raw(handle.into()) })
+    }
+}
+
+impl rwh::HasDisplayHandle for RawWindow {
+    fn display_handle(&self) -> Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
+        let handle = rwh::AppKitDisplayHandle::new();
+        Ok(unsafe { rwh::DisplayHandle::borrow_raw(handle.into()) })
+    }
+}
 use util::ResultExt;
 
 const WINDOW_STATE_IVAR: &str = "windowState";
@@ -413,7 +440,7 @@ struct MacWindowState {
     blurred_view: Option<id>,
     background_appearance: WindowBackgroundAppearance,
     display_link: Option<DisplayLink>,
-    renderer: renderer::Renderer,
+    renderer: WgpuRenderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -613,7 +640,7 @@ impl MacWindow {
         }: WindowParams,
         foreground_executor: ForegroundExecutor,
         background_executor: BackgroundExecutor,
-        renderer_context: renderer::Context,
+        gpu_context: GpuContext,
     ) -> Self {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
@@ -728,13 +755,17 @@ impl MacWindow {
                 blurred_view: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 display_link: None,
-                renderer: renderer::new_renderer(
-                    renderer_context,
-                    native_window as *mut _,
-                    native_view as *mut _,
-                    bounds.size.map(|pixels| pixels.as_f32()),
-                    false,
-                ),
+                renderer: {
+                    let raw_window = RawWindow {
+                        ns_view: NonNull::new_unchecked(native_view as *mut c_void),
+                    };
+                    let config = WgpuSurfaceConfig {
+                        size: bounds.size.map(|pixels| DevicePixels(pixels.as_f32() as i32)),
+                        transparent: false,
+                    };
+                    WgpuRenderer::new(gpu_context, &raw_window, config, None)
+                        .expect("Failed to create WgpuRenderer")
+                },
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -998,7 +1029,7 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
-        this.renderer.destroy();
+        // WgpuRenderer is cleaned up on drop
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.display_link.take();
@@ -1326,7 +1357,7 @@ impl PlatformWindow for MacWindow {
         this.background_appearance = background_appearance;
 
         let opaque = background_appearance == WindowBackgroundAppearance::Opaque;
-        this.renderer.update_transparency(!opaque);
+        // TODO: wgpu transparency needs surface reconfiguration
 
         unsafe {
             this.native_window.setOpaque_(opaque as BOOL);
@@ -1555,7 +1586,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
-        None
+        Some(self.0.lock().renderer.gpu_specs())
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
@@ -1632,9 +1663,8 @@ impl PlatformWindow for MacWindow {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
-        let mut this = self.0.lock();
-        this.renderer.render_to_image(scene)
+    fn render_to_image(&self, _scene: &gpui::Scene) -> Result<RgbaImage> {
+        anyhow::bail!("render_to_image is not yet implemented for the wgpu renderer")
     }
 }
 
@@ -2070,15 +2100,7 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
     let scale_factor = lock.scale_factor();
     let size = lock.content_size();
     let drawable_size = size.to_device_pixels(scale_factor);
-    if let Some(layer) = lock.renderer.layer() {
-        unsafe {
-            let _: () = msg_send![
-                layer,
-                setContentsScale: scale_factor as f64
-            ];
-        }
-    }
-
+    // wgpu manages its own surface layer; scale factor is handled via drawable size
     lock.renderer.update_drawable_size(drawable_size);
 
     if let Some(mut callback) = lock.resize_callback.take() {
@@ -2134,14 +2156,12 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
-                lock.renderer.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
                 callback(Default::default());
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
-                lock.renderer.set_presents_with_transaction(false);
                 lock.start_display_link();
             }
         } else {
@@ -2195,9 +2215,12 @@ extern "C" fn close_window(this: &Object, _: Sel) {
 }
 
 extern "C" fn make_backing_layer(this: &Object, _: Sel) -> id {
-    let window_state = unsafe { get_window_state(this) };
-    let window_state = window_state.as_ref().lock();
-    window_state.renderer.layer_ptr() as id
+    // wgpu manages its own CAMetalLayer via the surface.
+    // Return the view's default layer.
+    unsafe {
+        let superclass = class!(NSView);
+        msg_send![super(this, superclass), makeBackingLayer]
+    }
 }
 
 extern "C" fn view_did_change_backing_properties(this: &Object, _: Sel) {
@@ -2247,14 +2270,12 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
-        lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);
         callback(Default::default());
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
-        lock.renderer.set_presents_with_transaction(false);
         lock.start_display_link();
     }
 }

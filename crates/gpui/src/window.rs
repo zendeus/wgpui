@@ -1643,6 +1643,11 @@ impl Window {
         &self.text_system
     }
 
+    /// Access the sprite atlas used by this window for glyph caching.
+    pub fn sprite_atlas(&self) -> &Arc<dyn PlatformAtlas> {
+        &self.sprite_atlas
+    }
+
     /// The current text style. Which is composed of all the style refinements provided to `with_text_style`.
     pub fn text_style(&self) -> TextStyle {
         let mut style = TextStyle::default();
@@ -3641,6 +3646,30 @@ impl Window {
             bounds,
             content_mask,
             image_buffer,
+        });
+    }
+
+    /// Paint a gpu_canvas into the scene for the next frame at the current z-index.
+    ///
+    /// The callback is type-erased; the renderer will downcast it to the concrete
+    /// gpu_canvas callback type at draw time.
+    pub fn paint_gpu_canvas(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        callback: crate::GpuCanvasCallback,
+    ) {
+        use crate::PaintGpuCanvas;
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        self.next_frame.scene.insert_gpu_canvas(PaintGpuCanvas {
+            order: 0,
+            bounds,
+            content_mask,
+            callback,
         });
     }
 

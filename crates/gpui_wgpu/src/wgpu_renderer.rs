@@ -1,9 +1,10 @@
+use crate::gpu_canvas_composite::GpuCanvasCompositePipeline;
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, PaintGpuCanvas,
+    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
+    SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -12,6 +13,37 @@ use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+
+/// Context passed to gpu_canvas callbacks, providing access to wgpu resources
+/// and an offscreen render target.
+pub struct GpuCanvasContext<'a> {
+    /// The wgpu device for creating resources.
+    pub device: &'a wgpu::Device,
+    /// The wgpu queue for submitting commands.
+    pub queue: &'a wgpu::Queue,
+    /// The offscreen render target texture view.
+    pub target: &'a wgpu::TextureView,
+    /// The texture format of the render target.
+    pub target_format: wgpu::TextureFormat,
+    /// The size of the canvas in device pixels.
+    pub size: Size<DevicePixels>,
+    /// The display scale factor.
+    pub scale_factor: f32,
+    /// The sprite atlas for glyph texture lookups.
+    pub atlas: &'a WgpuAtlas,
+}
+
+/// Concrete callback type for gpu_canvas elements.
+pub type GpuCanvasCallback = Arc<dyn Fn(&mut GpuCanvasContext) + Send + Sync>;
+
+/// Cached offscreen texture for gpu_canvas rendering.
+struct CachedOffscreenTexture {
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -112,6 +144,7 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    gpu_canvas_composite_pipeline: GpuCanvasCompositePipeline,
 }
 
 pub struct WgpuRenderer {
@@ -138,6 +171,7 @@ pub struct WgpuRenderer {
     last_error: Arc<Mutex<Option<String>>>,
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cached_offscreen: Vec<CachedOffscreenTexture>,
 }
 
 impl WgpuRenderer {
@@ -428,6 +462,9 @@ impl WgpuRenderer {
             *guard = Some(error.to_string());
         }));
 
+        let gpu_canvas_composite_pipeline =
+            GpuCanvasCompositePipeline::new(&device, surface_config.format);
+
         let resources = WgpuResources {
             device,
             queue,
@@ -445,6 +482,7 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            gpu_canvas_composite_pipeline,
         };
 
         Ok(Self {
@@ -467,6 +505,7 @@ impl WgpuRenderer {
             last_error,
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
+            cached_offscreen: Vec::new(),
         })
     }
 
@@ -1150,6 +1189,12 @@ impl WgpuRenderer {
                     ..Default::default()
                 });
 
+                let mut canvas_offset: usize = 0;
+                let viewport_size = [
+                    self.surface_config.width as f32,
+                    self.surface_config.height as f32,
+                ];
+
                 for batch in scene.batches() {
                     let ok = match batch {
                         PrimitiveBatch::Quads(range) => {
@@ -1230,12 +1275,84 @@ impl WgpuRenderer {
                             // Not implemented for Linux/wgpu
                             true
                         }
+                        PrimitiveBatch::GpuCanvases(range) => {
+                            let canvases = &scene.gpu_canvases[range];
+                            if canvases.is_empty() {
+                                continue;
+                            }
+
+                            // Drop the main render pass so user callbacks can use the GPU
+                            drop(pass);
+
+                            // Run user callbacks to fill offscreen textures
+                            self.run_gpu_canvas_callbacks(canvases, canvas_offset);
+
+                            // Composite offscreen textures back onto the frame
+                            {
+                                let resources = self.resources();
+                                let mut composite_pass =
+                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("gpu_canvas_composite_pass"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view: &frame_view,
+                                                resolve_target: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Load,
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                                depth_slice: None,
+                                            },
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        ..Default::default()
+                                    });
+
+                                for (canvas, cached) in canvases
+                                    .iter()
+                                    .zip(&self.cached_offscreen[canvas_offset..])
+                                {
+                                    resources
+                                        .gpu_canvas_composite_pipeline
+                                        .draw(
+                                            &resources.device,
+                                            &mut composite_pass,
+                                            viewport_size,
+                                            canvas,
+                                            &cached.view,
+                                        );
+                                }
+                            }
+
+                            canvas_offset += canvases.len();
+
+                            // Resume the main render pass
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_continued"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+
+                            true
+                        }
                     };
                     if !ok {
                         overflow = true;
                         break;
                     }
                 }
+
+                // Trim cached offscreen textures to match actual usage
+                self.cached_offscreen.truncate(canvas_offset);
             }
 
             if overflow {
@@ -1567,6 +1684,72 @@ impl WgpuRenderer {
         }
 
         true
+    }
+
+    /// Create or reuse offscreen textures and invoke user callbacks for each gpu_canvas.
+    fn run_gpu_canvas_callbacks(&mut self, canvases: &[PaintGpuCanvas], offset: usize) {
+        let device = Arc::clone(&self.resources().device);
+        let queue = Arc::clone(&self.resources().queue);
+        let surface_format = self.surface_config.format;
+
+        for (i, canvas) in canvases.iter().enumerate() {
+            let idx = offset + i;
+            let width = (canvas.bounds.size.width.0.ceil() as u32).max(1);
+            let height = (canvas.bounds.size.height.0.ceil() as u32).max(1);
+
+            let needs_new = if let Some(cached) = self.cached_offscreen.get(idx) {
+                cached.width != width || cached.height != height
+            } else {
+                true
+            };
+
+            if needs_new {
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("gpu_canvas_offscreen"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: surface_format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let entry = CachedOffscreenTexture {
+                    texture,
+                    view,
+                    width,
+                    height,
+                };
+                if idx < self.cached_offscreen.len() {
+                    self.cached_offscreen[idx] = entry;
+                } else {
+                    self.cached_offscreen.push(entry);
+                }
+            }
+
+            let cached = &self.cached_offscreen[idx];
+            if let Some(callback) = canvas.callback.downcast_ref::<GpuCanvasCallback>() {
+                let mut context = GpuCanvasContext {
+                    device: &device,
+                    queue: &queue,
+                    target: &cached.view,
+                    target_format: surface_format,
+                    size: Size {
+                        width: DevicePixels(width as i32),
+                        height: DevicePixels(height as i32),
+                    },
+                    scale_factor: 1.0,
+                    atlas: &self.atlas,
+                };
+                callback(&mut context);
+            }
+        }
     }
 
     fn grow_instance_buffer(&mut self) {

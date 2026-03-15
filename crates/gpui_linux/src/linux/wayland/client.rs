@@ -39,6 +39,11 @@ use wayland_client::{
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
+use wayland_protocols::wp::tablet::zv2::client::{
+    zwp_tablet_manager_v2, zwp_tablet_pad_dial_v2, zwp_tablet_pad_group_v2,
+    zwp_tablet_pad_ring_v2, zwp_tablet_pad_strip_v2, zwp_tablet_pad_v2, zwp_tablet_seat_v2,
+    zwp_tablet_tool_v2, zwp_tablet_v2,
+};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::{
     self, ZwpPrimarySelectionOfferV1,
 };
@@ -93,10 +98,10 @@ use crate::linux::{
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, DisplayId, FileDropEvent,
     ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, Size, TaskTiming, TouchPhase, WindowParams, point,
-    profiler, px, size,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
+    NavigationDirection, Pixels, PlatformDisplay, PlatformInput, PlatformKeyboardLayout,
+    PlatformWindow, Point, PressureStage, ScrollDelta, ScrollWheelEvent, SharedString, Size,
+    TaskTiming, TouchPhase, WindowParams, point, profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -107,6 +112,29 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 const MIN_KEYCODE: u32 = 8;
 
 const UNKNOWN_KEYBOARD_LAYOUT_NAME: SharedString = SharedString::new_static("unknown");
+
+/// Accumulated tablet tool event state within a single frame.
+/// The tablet protocol batches events (motion, pressure, tilt, etc.)
+/// and finalizes them with a `frame` event.
+#[derive(Default)]
+struct TabletToolState {
+    /// Surface the tool is currently over (set by proximity_in).
+    surface: Option<wl_surface::WlSurface>,
+    /// Current tool position in surface-local coordinates.
+    position: Option<Point<Pixels>>,
+    /// Whether position changed this frame.
+    position_changed: bool,
+    /// Normalized pressure (0.0–1.0). The protocol sends 0–65535.
+    pressure: f32,
+    /// Whether pressure changed this frame.
+    pressure_changed: bool,
+    /// Tilt in degrees (x, y).
+    tilt: Option<(f32, f32)>,
+    /// Whether the tip is currently down (touching the surface).
+    tip_down: bool,
+    /// Tip state changed this frame (Some(true) = down, Some(false) = up).
+    tip_changed: Option<bool>,
+}
 
 #[derive(Clone)]
 pub struct Globals {
@@ -128,6 +156,7 @@ pub struct Globals {
     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
+    pub tablet_manager: Option<zwp_tablet_manager_v2::ZwpTabletManagerV2>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     pub executor: ForegroundExecutor,
 }
@@ -169,6 +198,7 @@ impl Globals {
             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
+            tablet_manager: globals.bind(&qh, 1..=1, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
             executor,
             qh,
@@ -250,6 +280,9 @@ pub(crate) struct WaylandClientState {
     keyboard_focused_window: Option<WaylandWindowStatePtr>,
     loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
     cursor_style: Option<CursorStyle>,
+    #[allow(dead_code)] // Stored for lifetime management; events dispatched via tool dispatch
+    tablet_seat: Option<zwp_tablet_seat_v2::ZwpTabletSeatV2>,
+    tablet_tool_state: TabletToolState,
     clipboard: Clipboard,
     data_offers: Vec<DataOffer<WlDataOffer>>,
     primary_data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
@@ -551,6 +584,14 @@ impl WaylandClient {
             .as_ref()
             .map(|primary_selection_manager| primary_selection_manager.get_device(&seat, &qh, ()));
 
+        let tablet_seat = globals
+            .tablet_manager
+            .as_ref()
+            .map(|manager| {
+                log::info!("zwp_tablet_manager_v2 available, requesting tablet seat");
+                manager.get_tablet_seat(&seat, &qh, ())
+            });
+
         let cursor = Cursor::new(&conn, &globals, 24);
 
         handle
@@ -646,6 +687,8 @@ impl WaylandClient {
             loop_handle: handle.clone(),
             enter_token: None,
             cursor_style: None,
+            tablet_seat,
+            tablet_tool_state: TabletToolState::default(),
             clipboard: Clipboard::new(conn.clone(), handle.clone()),
             data_offers: Vec::new(),
             primary_data_offer: None,
@@ -2461,6 +2504,309 @@ impl Dispatch<XdgDialogV1, ()> for WaylandClientStatePtr {
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+// Tablet manager dispatch (no events to handle)
+impl Dispatch<zwp_tablet_manager_v2::ZwpTabletManagerV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _state: &mut Self,
+        _proxy: &zwp_tablet_manager_v2::ZwpTabletManagerV2,
+        _event: zwp_tablet_manager_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+// Tablet seat dispatch — receives tool_added/tablet_added notifications
+impl Dispatch<zwp_tablet_seat_v2::ZwpTabletSeatV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _state: &mut Self,
+        _proxy: &zwp_tablet_seat_v2::ZwpTabletSeatV2,
+        event: zwp_tablet_seat_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_tablet_seat_v2::Event::ToolAdded { id } => {
+                log::info!("tablet tool added: {:?}", id.id());
+            }
+            zwp_tablet_seat_v2::Event::TabletAdded { id } => {
+                log::info!("tablet added: {:?}", id.id());
+            }
+            zwp_tablet_seat_v2::Event::PadAdded { id } => {
+                log::info!("tablet pad added: {:?}", id.id());
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(WaylandClientStatePtr, zwp_tablet_seat_v2::ZwpTabletSeatV2, [
+        zwp_tablet_seat_v2::EVT_TABLET_ADDED_OPCODE => (zwp_tablet_v2::ZwpTabletV2, ()),
+        zwp_tablet_seat_v2::EVT_TOOL_ADDED_OPCODE => (zwp_tablet_tool_v2::ZwpTabletToolV2, ()),
+        zwp_tablet_seat_v2::EVT_PAD_ADDED_OPCODE => (zwp_tablet_pad_v2::ZwpTabletPadV2, ()),
+    ]);
+}
+
+// Tablet device dispatch (log descriptive events)
+impl Dispatch<zwp_tablet_v2::ZwpTabletV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _state: &mut Self,
+        _proxy: &zwp_tablet_v2::ZwpTabletV2,
+        event: zwp_tablet_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_tablet_v2::Event::Name { name } => {
+                log::info!("tablet name: {name}");
+            }
+            zwp_tablet_v2::Event::Id { vid, pid } => {
+                log::info!("tablet id: vid={vid:#06x} pid={pid:#06x}");
+            }
+            zwp_tablet_v2::Event::Done => {
+                log::debug!("tablet descriptor done");
+            }
+            zwp_tablet_v2::Event::Removed => {
+                log::info!("tablet removed");
+            }
+            _ => {}
+        }
+    }
+}
+
+// Tablet tool dispatch — the main event source for pen input
+impl Dispatch<zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _proxy: &zwp_tablet_tool_v2::ZwpTabletToolV2,
+        event: zwp_tablet_tool_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        match event {
+            zwp_tablet_tool_v2::Event::ProximityIn {
+                serial,
+                surface,
+                ..
+            } => {
+                state.serial_tracker.update(SerialKind::MouseEnter, serial);
+                state.tablet_tool_state.surface = Some(surface);
+                log::debug!("tablet tool proximity_in");
+            }
+            zwp_tablet_tool_v2::Event::ProximityOut => {
+                // Dispatch a mouse exit if we had a surface
+                if let Some(ref surface) = state.tablet_tool_state.surface {
+                    let position = state.tablet_tool_state.position.unwrap_or_default();
+                    if let Some(window) = state.windows.get(&surface.id()).cloned() {
+                        let input = PlatformInput::MouseExited(MouseExitEvent {
+                            position,
+                            pressed_button: None,
+                            modifiers: state.modifiers,
+                        });
+                        drop(state);
+                        window.handle_input(input);
+                        let mut state = client.borrow_mut();
+                        state.tablet_tool_state.surface = None;
+                        state.tablet_tool_state.position = None;
+                        state.tablet_tool_state.tip_down = false;
+                        return;
+                    }
+                }
+                state.tablet_tool_state.surface = None;
+                state.tablet_tool_state.position = None;
+                state.tablet_tool_state.tip_down = false;
+                log::debug!("tablet tool proximity_out");
+            }
+            zwp_tablet_tool_v2::Event::Down { serial } => {
+                state.serial_tracker.update(SerialKind::MousePress, serial);
+                state.tablet_tool_state.tip_down = true;
+                state.tablet_tool_state.tip_changed = Some(true);
+            }
+            zwp_tablet_tool_v2::Event::Up => {
+                state.tablet_tool_state.tip_down = false;
+                state.tablet_tool_state.tip_changed = Some(false);
+            }
+            zwp_tablet_tool_v2::Event::Motion { x, y } => {
+                state.tablet_tool_state.position = Some(point(px(x as f32), px(y as f32)));
+                state.tablet_tool_state.position_changed = true;
+            }
+            zwp_tablet_tool_v2::Event::Pressure { pressure } => {
+                // Protocol range is 0–65535, normalize to 0.0–1.0
+                state.tablet_tool_state.pressure = pressure as f32 / 65535.0;
+                state.tablet_tool_state.pressure_changed = true;
+            }
+            zwp_tablet_tool_v2::Event::Tilt { tilt_x, tilt_y } => {
+                state.tablet_tool_state.tilt = Some((tilt_x as f32, tilt_y as f32));
+            }
+            zwp_tablet_tool_v2::Event::Frame { time: _ } => {
+                // Frame finalizes a batch of tool events — dispatch accumulated state
+                let surface = match state.tablet_tool_state.surface {
+                    Some(ref s) => s.clone(),
+                    None => return,
+                };
+                let position = match state.tablet_tool_state.position {
+                    Some(p) => p,
+                    None => return,
+                };
+                let window = match state.windows.get(&surface.id()).cloned() {
+                    Some(w) => w,
+                    None => return,
+                };
+
+                let tip_changed = state.tablet_tool_state.tip_changed;
+                let position_changed = state.tablet_tool_state.position_changed;
+                let pressure_changed = state.tablet_tool_state.pressure_changed;
+                let pressure = state.tablet_tool_state.pressure;
+                let tip_down = state.tablet_tool_state.tip_down;
+                let modifiers = state.modifiers;
+
+                // Reset per-frame state before dispatching (we drop state below)
+                state.tablet_tool_state.tip_changed = None;
+                state.tablet_tool_state.position_changed = false;
+                state.tablet_tool_state.pressure_changed = false;
+
+                drop(state);
+
+                // Dispatch tip down/up as MouseDown/MouseUp
+                if let Some(down) = tip_changed {
+                    if down {
+                        window.handle_input(PlatformInput::MouseDown(MouseDownEvent {
+                            position,
+                            button: MouseButton::Left,
+                            modifiers,
+                            click_count: 1,
+                            first_mouse: false,
+                        }));
+                    } else {
+                        window.handle_input(PlatformInput::MouseUp(MouseUpEvent {
+                            position,
+                            button: MouseButton::Left,
+                            modifiers,
+                            click_count: 1,
+                        }));
+                    }
+                }
+
+                // Dispatch motion as MouseMove
+                if position_changed {
+                    let pressed_button = if tip_down {
+                        Some(MouseButton::Left)
+                    } else {
+                        None
+                    };
+                    window.handle_input(PlatformInput::MouseMove(MouseMoveEvent {
+                        position,
+                        pressed_button,
+                        modifiers,
+                    }));
+                }
+
+                // Dispatch pressure as MousePressure
+                if pressure_changed {
+                    let stage = if pressure <= 0.0 {
+                        PressureStage::Zero
+                    } else {
+                        PressureStage::Normal
+                    };
+                    window.handle_input(PlatformInput::MousePressure(MousePressureEvent {
+                        pressure,
+                        stage,
+                        position,
+                        modifiers,
+                    }));
+                }
+            }
+            // Descriptive events during tool setup
+            zwp_tablet_tool_v2::Event::Type { tool_type } => {
+                log::info!("tablet tool type: {:?}", tool_type);
+            }
+            zwp_tablet_tool_v2::Event::Done => {
+                log::debug!("tablet tool descriptor done");
+            }
+            zwp_tablet_tool_v2::Event::Removed => {
+                log::info!("tablet tool removed");
+            }
+            _ => {}
+        }
+    }
+}
+
+// Tablet pad dispatch stubs (we don't use pad buttons/rings/strips)
+impl Dispatch<zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _state: &mut Self,
+        _proxy: &zwp_tablet_pad_v2::ZwpTabletPadV2,
+        _event: zwp_tablet_pad_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+
+    wayland_client::event_created_child!(WaylandClientStatePtr, zwp_tablet_pad_v2::ZwpTabletPadV2, [
+        zwp_tablet_pad_v2::EVT_GROUP_OPCODE => (zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()),
+    ]);
+}
+
+impl Dispatch<zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _state: &mut Self,
+        _proxy: &zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
+        _event: zwp_tablet_pad_group_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+
+    wayland_client::event_created_child!(WaylandClientStatePtr, zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, [
+        zwp_tablet_pad_group_v2::EVT_RING_OPCODE => (zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()),
+        zwp_tablet_pad_group_v2::EVT_STRIP_OPCODE => (zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()),
+        zwp_tablet_pad_group_v2::EVT_DIAL_OPCODE => (zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2, ()),
+    ]);
+}
+
+impl Dispatch<zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _state: &mut Self,
+        _proxy: &zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
+        _event: zwp_tablet_pad_ring_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _state: &mut Self,
+        _proxy: &zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
+        _event: zwp_tablet_pad_strip_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _state: &mut Self,
+        _proxy: &zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2,
+        _event: zwp_tablet_pad_dial_v2::Event,
+        _data: &(),
+        _conn: &Connection,
+        _queue_handle: &QueueHandle<Self>,
     ) {
     }
 }

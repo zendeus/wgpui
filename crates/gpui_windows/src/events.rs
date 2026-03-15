@@ -10,7 +10,7 @@ use windows::{
         UI::{
             Controls::*,
             HiDpi::*,
-            Input::{Ime::*, KeyboardAndMouse::*},
+            Input::{Ime::*, KeyboardAndMouse::*, Pointer::*},
             WindowsAndMessaging::*,
         },
     },
@@ -106,6 +106,7 @@ impl WindowsWindowInner {
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
             WM_SETCURSOR => self.handle_set_cursor(handle, lparam),
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
+            WM_POINTERUPDATE => self.handle_pointer_update_msg(handle, wparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
             WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
@@ -207,13 +208,11 @@ impl WindowsWindowInner {
         let new_logical_size = device_size.to_pixels(scale_factor);
 
         self.state.logical_size.set(new_logical_size);
-        if should_resize_renderer
-            && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
-        {
-            log::error!("Failed to resize renderer, invalidating devices: {}", e);
+        if should_resize_renderer {
             self.state
-                .invalidate_devices
-                .store(true, std::sync::atomic::Ordering::Release);
+                .renderer
+                .borrow_mut()
+                .update_drawable_size(device_size);
         }
         if let Some(mut callback) = self.state.callbacks.resize.take() {
             callback(new_logical_size, scale_factor);
@@ -464,6 +463,64 @@ impl WindowsWindowInner {
         self.state.callbacks.input.set(Some(func));
 
         if handled { Some(0) } else { Some(1) }
+    }
+
+    fn handle_pointer_update_msg(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
+        let pointer_id = wparam.loword() as u32;
+
+        // Check if this is a pen pointer — only pens have pressure
+        let mut pointer_type = POINTER_INPUT_TYPE::default();
+        if unsafe { GetPointerType(pointer_id, &mut pointer_type) }.is_err() {
+            return None;
+        }
+        if pointer_type != PT_PEN {
+            return None;
+        }
+
+        let mut pen_info = POINTER_PEN_INFO::default();
+        if unsafe { GetPointerPenInfo(pointer_id, &mut pen_info) }.is_err() {
+            return None;
+        }
+
+        // Only dispatch if pressure info is present
+        if !pen_info
+            .pointerInfo
+            .pointerFlags
+            .contains(POINTER_FLAG_INRANGE)
+        {
+            return None;
+        }
+
+        let Some(mut func) = self.state.callbacks.input.take() else {
+            return Some(1);
+        };
+
+        let scale_factor = self.state.scale_factor.get();
+
+        // Convert screen coordinates to client coordinates
+        let mut pt = pen_info.pointerInfo.ptPixelLocation;
+        unsafe { ScreenToClient(handle, &mut pt) };
+
+        let position = logical_point(pt.x as f32, pt.y as f32, scale_factor);
+
+        // Pen pressure is 0-1024
+        let pressure = pen_info.pressure as f32 / 1024.0;
+        let stage = if pressure <= 0.0 {
+            PressureStage::Zero
+        } else {
+            PressureStage::Normal
+        };
+
+        let input = PlatformInput::MousePressure(MousePressureEvent {
+            pressure,
+            stage,
+            position,
+            modifiers: current_modifiers(),
+        });
+        let handled = !func(input).propagate;
+        self.state.callbacks.input.set(Some(func));
+
+        if handled { Some(0) } else { None }
     }
 
     fn handle_xbutton_msg(
@@ -1125,17 +1182,8 @@ impl WindowsWindowInner {
         None
     }
 
-    fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
-        let devices = lparam.0 as *const DirectXDevices;
-        let devices = unsafe { &*devices };
-        if let Err(err) = self
-            .state
-            .renderer
-            .borrow_mut()
-            .handle_device_lost(&devices)
-        {
-            panic!("Device lost: {err}");
-        }
+    fn handle_device_lost(&self, _lparam: LPARAM) -> Option<isize> {
+        // wgpu handles device lost internally via device_lost callback
         Some(0)
     }
 
@@ -1143,10 +1191,6 @@ impl WindowsWindowInner {
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
         let mut request_frame = self.state.callbacks.request_frame.take()?;
 
-        // we are instructing gpui to force render a frame, this will
-        // re-populate all the gpu textures for us so we can resume drawing in
-        // case we disabled drawing earlier due to a device loss
-        self.state.renderer.borrow_mut().mark_drawable();
         request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render,

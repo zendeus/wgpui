@@ -9,10 +9,12 @@ use crate::{
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
+    any::Any,
     fmt::Debug,
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -36,6 +38,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub gpu_canvases: Vec<PaintGpuCanvas>,
 }
 
 #[expect(missing_docs)]
@@ -52,6 +55,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.gpu_canvases.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -68,6 +72,22 @@ impl Scene {
     pub fn pop_layer(&mut self) {
         self.layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
+    }
+
+    pub fn insert_gpu_canvas(&mut self, mut gpu_canvas: PaintGpuCanvas) {
+        let clipped_bounds = gpu_canvas
+            .bounds
+            .intersect(&gpu_canvas.content_mask.bounds);
+        if clipped_bounds.is_empty() {
+            return;
+        }
+        let order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        gpu_canvas.order = order;
+        self.gpu_canvases.push(gpu_canvas);
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
@@ -146,6 +166,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.gpu_canvases.sort_by_key(|canvas| canvas.order);
     }
 
     #[cfg_attr(
@@ -173,6 +194,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            gpu_canvases_start: 0,
+            gpu_canvases_iter: self.gpu_canvases.iter().peekable(),
         }
     }
 }
@@ -195,6 +218,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    GpuCanvas,
 }
 
 pub(crate) enum PaintOperation {
@@ -269,6 +293,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    gpu_canvases_start: usize,
+    gpu_canvases_iter: Peekable<slice::Iter<'a, PaintGpuCanvas>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -301,6 +327,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.gpu_canvases_iter.peek().map(|c| c.order),
+                PrimitiveKind::GpuCanvas,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -447,6 +477,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::GpuCanvas => {
+                let canvases_start = self.gpu_canvases_start;
+                let mut canvases_end = canvases_start + 1;
+                self.gpu_canvases_iter.next();
+                while self
+                    .gpu_canvases_iter
+                    .next_if(|canvas| (canvas.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    canvases_end += 1;
+                }
+                self.gpu_canvases_start = canvases_end;
+                Some(PrimitiveBatch::GpuCanvases(canvases_start..canvases_end))
+            }
         }
     }
 }
@@ -479,6 +523,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    GpuCanvases(Range<usize>),
 }
 
 #[derive(Default, Debug, Clone)]
@@ -724,6 +769,19 @@ impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
     }
+}
+
+/// Type-erased callback for gpu_canvas elements.
+/// The renderer downcasts the inner `Arc<dyn Any + Send + Sync>` to its concrete callback type.
+pub type GpuCanvasCallback = Arc<dyn Any + Send + Sync>;
+
+/// A gpu_canvas paint operation in the scene.
+#[allow(missing_docs)]
+pub struct PaintGpuCanvas {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub callback: GpuCanvasCallback,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

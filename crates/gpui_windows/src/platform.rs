@@ -46,6 +46,7 @@ pub struct WindowsPlatform {
     invalidate_devices: Arc<AtomicBool>,
     handle: HWND,
     disable_direct_composition: bool,
+    gpu_context: gpui_wgpu::GpuContext,
 }
 
 struct WindowsPlatformInner {
@@ -126,6 +127,8 @@ impl WindowsPlatform {
         let raw_window_handles = Arc::new(RwLock::new(SmallVec::new()));
 
         register_platform_window_class();
+        let gpu_context: gpui_wgpu::GpuContext =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
         let mut context = PlatformWindowCreateContext {
             inner: None,
             raw_window_handles: Arc::downgrade(&raw_window_handles),
@@ -134,6 +137,7 @@ impl WindowsPlatform {
             main_receiver: Some(main_receiver),
             directx_devices,
             dispatcher: None,
+            gpu_context: Some(gpu_context),
         };
         let result = unsafe {
             CreateWindowExW(
@@ -157,6 +161,10 @@ impl WindowsPlatform {
             .context("CreateWindowExW did not run correctly")??;
         let dispatcher = context
             .dispatcher
+            .take()
+            .context("CreateWindowExW did not run correctly")?;
+        let gpu_context = context
+            .gpu_context
             .take()
             .context("CreateWindowExW did not run correctly")?;
         let handle = result?;
@@ -193,6 +201,7 @@ impl WindowsPlatform {
             disable_direct_composition,
             drop_target_helper,
             invalidate_devices: Arc::new(AtomicBool::new(false)),
+            gpu_context,
         })
     }
 
@@ -226,6 +235,7 @@ impl WindowsPlatform {
             disable_direct_composition: self.disable_direct_composition,
             directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
             invalidate_devices: self.invalidate_devices.clone(),
+            gpu_context: self.gpu_context.clone(),
         }
     }
 
@@ -1013,6 +1023,7 @@ pub(crate) struct WindowCreationInfo {
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     pub(crate) invalidate_devices: Arc<AtomicBool>,
+    pub(crate) gpu_context: gpui_wgpu::GpuContext,
 }
 
 struct PlatformWindowCreateContext {
@@ -1023,6 +1034,7 @@ struct PlatformWindowCreateContext {
     main_receiver: Option<PriorityQueueReceiver<RunnableVariant>>,
     directx_devices: Option<DirectXDevices>,
     dispatcher: Option<Arc<WindowsDispatcher>>,
+    gpu_context: Option<gpui_wgpu::GpuContext>,
 }
 
 fn open_target(target: impl AsRef<OsStr>) -> Result<()> {

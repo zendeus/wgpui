@@ -145,9 +145,6 @@ ureq = "3"
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 http_client = { workspace = true, features = ["test-support"] }
-gpui_wgpu = { workspace = true }
-bytemuck = "1"
-wgpu = { workspace = true }
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-bindgen = { workspace = true }
@@ -237,3 +234,7 @@ path = "examples/drawing.rs"
 [[example]]
 name = "gpu_canvas_triangle"
 path = "examples/gpu_canvas_triangle.rs"
+
+[[example]]
+name = "video_surface"
+path = "examples/video_surface.rs"

@@ -204,9 +204,9 @@ dependencies = [
 
 [[package]]
 name = "ashpd"
-version = "0.13.5"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b09507a218cf6eb4ab0659883e54880cea3984e3dbaa4989b6cda3f8f8a97a5"
+checksum = "2db8976f2184938619146d8416140cea548c91256158f59258849069ce7787c0"
 dependencies = [
  "enumflags2",
  "futures-channel",
@@ -2116,7 +2116,6 @@ dependencies = [
  "bindgen",
  "bitflags 2.11.0",
  "block",
- "bytemuck",
  "chrono",
  "circular-buffer",
  "cocoa",
@@ -2140,7 +2139,6 @@ dependencies = [
  "gpui_platform",
  "gpui_util",
  "gpui_web",
- "gpui_wgpu",
  "http_client",
  "image",
  "inventory",
@@ -2186,7 +2184,6 @@ dependencies = [
  "waker-fn",
  "wasm-bindgen",
  "web-time",
- "wgpu",
  "windows 0.61.3",
  "zed-font-kit",
 ]
@@ -2336,13 +2333,17 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "collections",
+ "core-foundation",
+ "core-video",
  "cosmic-text",
  "etagere",
  "gpui",
  "gpui_util",
  "itertools 0.14.0",
  "js-sys",
+ "libc",
  "log",
+ "metal",
  "parking_lot",
  "pollster 0.4.0",
  "profiling",

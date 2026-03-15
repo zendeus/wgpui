@@ -3,9 +3,10 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, PaintGpuCanvas,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    SubpixelSprite, Underline, get_gamma_correction_ratios,
+    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
+    Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
+use wgpu::util::DeviceExt;
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -72,6 +73,8 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    format: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -170,6 +173,8 @@ pub struct WgpuRenderer {
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     cached_offscreen: Vec<CachedOffscreenTexture>,
+    #[cfg(target_os = "macos")]
+    metal_texture_cache: Option<core_video::metal_texture_cache::CVMetalTextureCache>,
 }
 
 impl WgpuRenderer {
@@ -504,7 +509,20 @@ impl WgpuRenderer {
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
             cached_offscreen: Vec::new(),
+            #[cfg(target_os = "macos")]
+            metal_texture_cache: Self::create_metal_texture_cache(&context.device),
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_metal_texture_cache(
+        device: &wgpu::Device,
+    ) -> Option<core_video::metal_texture_cache::CVMetalTextureCache> {
+        unsafe {
+            let hal_device = device.as_hal::<wgpu::hal::metal::Api>()?;
+            let mtl_device = hal_device.raw_device().clone();
+            core_video::metal_texture_cache::CVMetalTextureCache::new(None, mtl_device, None).ok()
+        }
     }
 
     fn create_bind_group_layouts(device: &wgpu::Device) -> WgpuBindGroupLayouts {
@@ -1268,10 +1286,9 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
-                        PrimitiveBatch::Surfaces(_surfaces) => {
-                            // Surfaces are macOS-only for video playback
-                            // Not implemented for Linux/wgpu
-                            true
+                        PrimitiveBatch::Surfaces(range) => {
+                            let surfaces = &scene.surfaces[range];
+                            self.draw_surfaces(surfaces, &mut pass)
                         }
                         PrimitiveBatch::GpuCanvases(range) => {
                             let canvases = &scene.gpu_canvases[range];
@@ -1484,6 +1501,79 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    fn draw_surfaces(
+        &self,
+        surfaces: &[PaintSurface],
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        if surfaces.is_empty() {
+            return true;
+        }
+
+        let resources = self.resources();
+
+        for surface in surfaces {
+            let imported = crate::surface_importer::import_video_frame(
+                &resources.device,
+                &resources.queue,
+                &surface.frame,
+                #[cfg(target_os = "macos")]
+                self.metal_texture_cache.as_ref(),
+            );
+
+            let params = SurfaceParams {
+                bounds: surface.bounds.into(),
+                content_mask: surface.content_mask.bounds.into(),
+                format: match imported.format {
+                    gpui::VideoFrameFormat::Nv12 => 0,
+                    gpui::VideoFrameFormat::Bgra => 1,
+                },
+                _pad: [0; 3],
+            };
+
+            let uniform_buffer =
+                resources
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("surface_params"),
+                        contents: bytemuck::bytes_of(&params),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+
+            let bind_group = resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("surface_bind_group"),
+                    layout: &resources.bind_group_layouts.surfaces,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniform_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&imported.y_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&imported.cbcr_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                        },
+                    ],
+                });
+
+            pass.set_pipeline(&resources.pipelines.surfaces);
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+
+        true
     }
 
     fn draw_instances(

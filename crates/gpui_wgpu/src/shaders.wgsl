@@ -1288,6 +1288,11 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    // 0 = NV12 (YCbCr), 1 = BGRA
+    format: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
@@ -1326,6 +1331,12 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
+    if (surface_locals.format == 1u) {
+        // BGRA: sample directly from t_y (bound as Bgra8Unorm)
+        return textureSampleLevel(t_y, s_surface, input.texture_position, 0.0);
+    }
+
+    // NV12: YCbCr conversion from two planes
     let y_cb_cr = vec4<f32>(
         textureSampleLevel(t_y, s_surface, input.texture_position, 0.0).r,
         textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,

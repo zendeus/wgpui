@@ -1,5 +1,6 @@
 mod cosmic_text_system;
 mod gpu_canvas_composite;
+mod surface_importer;
 mod wgpu_atlas;
 mod wgpu_context;
 mod wgpu_renderer;

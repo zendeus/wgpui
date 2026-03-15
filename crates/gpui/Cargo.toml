@@ -237,3 +237,7 @@ path = "examples/drawing.rs"
 [[example]]
 name = "gpu_canvas_triangle"
 path = "examples/gpu_canvas_triangle.rs"
+
+[[example]]
+name = "video_surface"
+path = "examples/video_surface.rs"

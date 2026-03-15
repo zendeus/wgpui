@@ -2080,6 +2080,7 @@ dependencies = [
  "bindgen",
  "bitflags 2.11.0",
  "block",
+ "bytemuck",
  "chrono",
  "circular-buffer",
  "cocoa",
@@ -2102,6 +2103,7 @@ dependencies = [
  "gpui_platform",
  "gpui_util",
  "gpui_web",
+ "gpui_wgpu",
  "http_client",
  "image",
  "inventory",
@@ -2146,6 +2148,7 @@ dependencies = [
  "waker-fn",
  "wasm-bindgen",
  "web-time",
+ "wgpu",
  "windows 0.61.3",
  "zed-font-kit",
 ]

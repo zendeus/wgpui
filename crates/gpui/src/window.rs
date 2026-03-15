@@ -3644,6 +3644,30 @@ impl Window {
         });
     }
 
+    /// Paint a gpu_canvas into the scene for the next frame at the current z-index.
+    ///
+    /// The callback is type-erased; the renderer will downcast it to the concrete
+    /// gpu_canvas callback type at draw time.
+    pub fn paint_gpu_canvas(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        callback: crate::GpuCanvasCallback,
+    ) {
+        use crate::PaintGpuCanvas;
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        self.next_frame.scene.insert_gpu_canvas(PaintGpuCanvas {
+            order: 0,
+            bounds,
+            content_mask,
+            callback,
+        });
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {

@@ -12,7 +12,7 @@ workspace = true
 path = "src/gpui_platform.rs"
 
 [features]
-default = []
+default = ["font-kit"]
 font-kit = ["gpui_macos/font-kit"]
 test-support = ["gpui/test-support", "gpui_macos/test-support"]
 wayland = ["gpui_linux/wayland"]

@@ -2,9 +2,9 @@ use crate::gpu_canvas_composite::GpuCanvasCompositePipeline;
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, PaintGpuCanvas,
-    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
-    Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, Corners, DevicePixels, GpuSpecs, MonochromeSprite,
+    PaintGpuCanvas, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
+    ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use wgpu::util::DeviceExt;
 use log::warn;
@@ -75,6 +75,7 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    content_mask_corner_radii: [f32; 4],
     format: u32,
     _pad: [u32; 3],
 }
@@ -101,6 +102,8 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    content_mask_bounds: Bounds<ScaledPixels>,
+    content_mask_corner_radii: Corners<ScaledPixels>,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -1528,6 +1531,12 @@ impl WgpuRenderer {
             let params = SurfaceParams {
                 bounds: surface.bounds.into(),
                 content_mask: surface.content_mask.bounds.into(),
+                content_mask_corner_radii: [
+                    surface.content_mask.corner_radii.top_left.0,
+                    surface.content_mask.corner_radii.top_right.0,
+                    surface.content_mask.corner_radii.bottom_right.0,
+                    surface.content_mask.corner_radii.bottom_left.0,
+                ],
                 format: match imported.format {
                     gpui::VideoFrameFormat::Nv12 => 0,
                     gpui::VideoFrameFormat::Bgra => 1,
@@ -1715,6 +1724,8 @@ impl WgpuRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                content_mask_bounds: path.content_mask.bounds,
+                content_mask_corner_radii: path.content_mask.corner_radii,
             }));
         }
 

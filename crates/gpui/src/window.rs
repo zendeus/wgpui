@@ -1471,13 +1471,14 @@ pub struct DispatchEventResult {
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
-/// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
-/// to leave room to support more complex shapes in the future.
+/// rendered. Supports both rectangular and rounded-rectangle clipping via optional corner radii.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+    /// The corner radii for rounded clipping. Zero radii means rectangular clipping.
+    pub corner_radii: Corners<P>,
 }
 
 impl ContentMask<Pixels> {
@@ -1485,13 +1486,36 @@ impl ContentMask<Pixels> {
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            corner_radii: self.corner_radii.scale(factor),
         }
     }
 
     /// Intersect the content mask with the given content mask.
+    /// For corner radii, takes the minimum of each corner from both masks,
+    /// clamped to half the intersection bounds size.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+        let max_radius_x = bounds.size.width * 0.5;
+        let max_radius_y = bounds.size.height * 0.5;
+        let max_radius = Pixels(max_radius_x.0.min(max_radius_y.0));
+        let min_r =
+            |a: Pixels, b: Pixels| -> Pixels { Pixels(a.0.min(b.0).min(max_radius.0)) };
+        let corner_radii = Corners {
+            top_left: min_r(self.corner_radii.top_left, other.corner_radii.top_left),
+            top_right: min_r(self.corner_radii.top_right, other.corner_radii.top_right),
+            bottom_right: min_r(
+                self.corner_radii.bottom_right,
+                other.corner_radii.bottom_right,
+            ),
+            bottom_left: min_r(
+                self.corner_radii.bottom_left,
+                other.corner_radii.bottom_left,
+            ),
+        };
+        ContentMask {
+            bounds,
+            corner_radii,
+        }
     }
 }
 
@@ -2881,6 +2905,7 @@ impl Window {
                     origin: Point::default(),
                     size: self.viewport_size,
                 },
+                corner_radii: Corners::default(),
             })
     }
 

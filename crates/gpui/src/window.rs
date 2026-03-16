@@ -1498,16 +1498,27 @@ impl ContentMask<Pixels> {
         let max_radius_x = bounds.size.width * 0.5;
         let max_radius_y = bounds.size.height * 0.5;
         let max_radius = Pixels(max_radius_x.0.min(max_radius_y.0));
-        let min_r =
-            |a: Pixels, b: Pixels| -> Pixels { Pixels(a.0.min(b.0).min(max_radius.0)) };
+        // Merge corner radii: zero means "no rounding constraint".
+        // If both are non-zero, take the min (tightest clip).
+        // If one is zero (unconstrained), use the other's radius.
+        let merge_r = |a: Pixels, b: Pixels| -> Pixels {
+            let r = if a.0 == 0.0 {
+                b.0
+            } else if b.0 == 0.0 {
+                a.0
+            } else {
+                a.0.min(b.0)
+            };
+            Pixels(r.min(max_radius.0))
+        };
         let corner_radii = Corners {
-            top_left: min_r(self.corner_radii.top_left, other.corner_radii.top_left),
-            top_right: min_r(self.corner_radii.top_right, other.corner_radii.top_right),
-            bottom_right: min_r(
+            top_left: merge_r(self.corner_radii.top_left, other.corner_radii.top_left),
+            top_right: merge_r(self.corner_radii.top_right, other.corner_radii.top_right),
+            bottom_right: merge_r(
                 self.corner_radii.bottom_right,
                 other.corner_radii.bottom_right,
             ),
-            bottom_left: min_r(
+            bottom_left: merge_r(
                 self.corner_radii.bottom_left,
                 other.corner_radii.bottom_left,
             ),

@@ -354,6 +354,43 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
+        // Pre-shape text without wrapping so the measure callback can use the
+        // cached result as a fast path.  This avoids expensive text shaping
+        // inside Taffy's measure loop for the common case where wrapping doesn't
+        // change the result (single-line text, or wrap_width >= natural width).
+        let needs_wrapping = text_style.white_space == WhiteSpace::Normal;
+        let has_truncation = text_style.text_overflow.is_some();
+
+        if !has_truncation {
+            if let Some(lines) = window
+                .text_system()
+                .shape_text(
+                    text.clone(),
+                    font_size,
+                    &runs,
+                    None,  // no wrap width — measure natural size
+                    None,  // no line clamp
+                )
+                .log_err()
+            {
+                let mut size: Size<Pixels> = Size::default();
+                for line in &lines {
+                    let line_size = line.size(line_height);
+                    size.height += line_size.height;
+                    size.width = size.width.max(line_size.width).ceil();
+                }
+                let len = text.len();
+                self.0.borrow_mut().replace(TextLayoutInner {
+                    lines,
+                    len,
+                    line_height,
+                    wrap_width: None,
+                    size: Some(size),
+                    bounds: None,
+                });
+            }
+        }
+
         window.request_measured_layout(Default::default(), {
             let element_state = self.clone();
 
@@ -385,17 +422,19 @@ impl TextLayout {
                         (None, "".into(), TruncateFrom::End)
                     };
 
-                // Only use cached layout if:
-                // 1. We have a cached size
-                // 2. wrap_width matches (or both are None)
-                // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
-                //    because the previous layout may have been computed without truncation)
+                // Fast path: use pre-shaped layout when wrapping won't change the result.
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
                     && truncate_width.is_none()
                 {
-                    return size;
+                    // If no wrapping requested, or the available width is at least as wide as
+                    // the natural text width, the pre-shaped result is correct.
+                    if wrap_width.is_none()
+                        || wrap_width == text_layout.wrap_width
+                        || wrap_width.is_some_and(|w| w >= size.width)
+                    {
+                        return size;
+                    }
                 }
 
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);

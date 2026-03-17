@@ -1491,36 +1491,85 @@ impl ContentMask<Pixels> {
     }
 
     /// Intersect the content mask with the given content mask.
-    /// For corner radii, takes the minimum of each corner from both masks,
-    /// clamped to half the intersection bounds size.
+    /// Corner radii are adjusted based on how much the intersection bounds are inset
+    /// from each mask's original bounds. This prevents parent corner radii from being
+    /// incorrectly applied to children that are inset from the parent's corners.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
         let max_radius_x = bounds.size.width * 0.5;
         let max_radius_y = bounds.size.height * 0.5;
         let max_radius = Pixels(max_radius_x.0.min(max_radius_y.0));
-        // Merge corner radii: zero means "no rounding constraint".
-        // If both are non-zero, take the min (tightest clip).
-        // If one is zero (unconstrained), use the other's radius.
-        let merge_r = |a: Pixels, b: Pixels| -> Pixels {
-            let r = if a.0 == 0.0 {
-                b.0
-            } else if b.0 == 0.0 {
-                a.0
-            } else {
-                a.0.min(b.0)
-            };
-            Pixels(r.min(max_radius.0))
+
+        // Adjust a corner radius based on how far the intersection is inset from the
+        // original mask's corner. The radius shrinks by the inset distance, reaching
+        // zero when the intersection is fully past the rounded area.
+        let adjust = |radius: Pixels, inset_a: Pixels, inset_b: Pixels| -> Pixels {
+            let inset = inset_a.0.max(inset_b.0);
+            Pixels((radius.0 - inset).max(0.0))
         };
+
+        // For each corner, compute the adjusted radius from both masks, then take
+        // the larger (tighter clip), clamped to half the intersection size.
+        let merge_corner =
+            |r_self: Pixels,
+             r_other: Pixels,
+             self_inset_x: Pixels,
+             self_inset_y: Pixels,
+             other_inset_x: Pixels,
+             other_inset_y: Pixels|
+             -> Pixels {
+                let adj_self = adjust(r_self, self_inset_x, self_inset_y);
+                let adj_other = adjust(r_other, other_inset_x, other_inset_y);
+                Pixels(adj_self.0.max(adj_other.0).min(max_radius.0))
+            };
+
+        // Insets from each mask's bounds to the intersection bounds, per edge.
+        let self_inset_left = bounds.origin.x - self.bounds.origin.x;
+        let self_inset_top = bounds.origin.y - self.bounds.origin.y;
+        let self_inset_right =
+            self.bounds.bottom_right().x - bounds.bottom_right().x;
+        let self_inset_bottom =
+            self.bounds.bottom_right().y - bounds.bottom_right().y;
+
+        let other_inset_left = bounds.origin.x - other.bounds.origin.x;
+        let other_inset_top = bounds.origin.y - other.bounds.origin.y;
+        let other_inset_right =
+            other.bounds.bottom_right().x - bounds.bottom_right().x;
+        let other_inset_bottom =
+            other.bounds.bottom_right().y - bounds.bottom_right().y;
+
         let corner_radii = Corners {
-            top_left: merge_r(self.corner_radii.top_left, other.corner_radii.top_left),
-            top_right: merge_r(self.corner_radii.top_right, other.corner_radii.top_right),
-            bottom_right: merge_r(
+            top_left: merge_corner(
+                self.corner_radii.top_left,
+                other.corner_radii.top_left,
+                self_inset_left,
+                self_inset_top,
+                other_inset_left,
+                other_inset_top,
+            ),
+            top_right: merge_corner(
+                self.corner_radii.top_right,
+                other.corner_radii.top_right,
+                self_inset_right,
+                self_inset_top,
+                other_inset_right,
+                other_inset_top,
+            ),
+            bottom_right: merge_corner(
                 self.corner_radii.bottom_right,
                 other.corner_radii.bottom_right,
+                self_inset_right,
+                self_inset_bottom,
+                other_inset_right,
+                other_inset_bottom,
             ),
-            bottom_left: merge_r(
+            bottom_left: merge_corner(
                 self.corner_radii.bottom_left,
                 other.corner_radii.bottom_left,
+                self_inset_left,
+                self_inset_bottom,
+                other_inset_left,
+                other_inset_bottom,
             ),
         };
         ContentMask {

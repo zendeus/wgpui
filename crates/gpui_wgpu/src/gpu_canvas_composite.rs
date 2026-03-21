@@ -11,6 +11,7 @@ struct GpuCanvasCompositeUniforms {
     bounds_size: [f32; 2],
     content_mask_origin: [f32; 2],
     content_mask_size: [f32; 2],
+    _padding: [f32; 2], // align content_mask_corner_radii to 16-byte boundary (std140)
     content_mask_corner_radii: [f32; 4],
 }
 
@@ -149,6 +150,7 @@ impl GpuCanvasCompositePipeline {
                 canvas.content_mask.bounds.size.width.0,
                 canvas.content_mask.bounds.size.height.0,
             ],
+            _padding: [0.0; 2],
             content_mask_corner_radii: [
                 canvas.content_mask.corner_radii.top_left.0,
                 canvas.content_mask.corner_radii.top_right.0,

@@ -130,6 +130,24 @@ impl WgpuContext {
             );
         }
 
+        if adapter
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES)
+        {
+            // INSIDE_PASSES implies TIMESTAMP_QUERY + INSIDE_ENCODERS; request all explicitly.
+            required_features |= wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+                | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+        } else if adapter
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
+        {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+            log::info!("Timestamp queries available (encoder-level only, not inside passes).");
+        } else {
+            log::info!("GPU timestamp queries not available on this adapter.");
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("gpui_device"),

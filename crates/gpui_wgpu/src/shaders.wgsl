@@ -205,15 +205,39 @@ fn distance_from_clip_rect_transformed(unit_vertex: vec2<f32>, bounds: Bounds, c
     return distance_from_clip_rect_impl(transformed, clip_bounds);
 }
 
+/// Compute the SDF contribution of a single corner.
+/// `p` is the pixel position mirrored so this corner is in the positive quadrant.
+fn corner_sdf(p: vec2<f32>, half_size: vec2<f32>, radius: f32) -> f32 {
+    let q = p - half_size + radius;
+    return length(max(vec2<f32>(0.0), q)) + min(0.0, max(q.x, q.y)) - radius;
+}
+
+/// Rounded-rect SDF that is continuous across quadrant boundaries even with
+/// asymmetric corner radii. Computes all four corners independently and takes
+/// the max (geometric intersection), avoiding the discontinuity that
+/// `pick_corner_radius` causes when adjacent corners have very different radii.
+fn quad_sdf_continuous(point: vec2<f32>, bounds: Bounds, radii: Corners) -> f32 {
+    let half_size = bounds.size / 2.0;
+    let center = bounds.origin + half_size;
+    let p = point - center;
+
+    let d_tl = corner_sdf(vec2<f32>(-p.x, -p.y), half_size, radii.top_left);
+    let d_tr = corner_sdf(vec2<f32>( p.x, -p.y), half_size, radii.top_right);
+    let d_br = corner_sdf(vec2<f32>( p.x,  p.y), half_size, radii.bottom_right);
+    let d_bl = corner_sdf(vec2<f32>(-p.x,  p.y), half_size, radii.bottom_left);
+
+    return max(max(d_tl, d_tr), max(d_br, d_bl));
+}
+
 /// Returns an alpha value for rounded content mask clipping.
 /// When corner radii are all zero, returns 1.0 (no additional clipping needed beyond AABB).
-/// Otherwise uses the quad SDF to compute a smooth alpha at the rounded clip boundary.
+/// Uses a continuous SDF that handles asymmetric corner radii without artifacts.
 fn clip_content_mask(pixel_pos: vec2<f32>, mask_bounds: Bounds, mask_radii: Corners) -> f32 {
     if mask_radii.top_left == 0.0 && mask_radii.top_right == 0.0
         && mask_radii.bottom_right == 0.0 && mask_radii.bottom_left == 0.0 {
         return 1.0;
     }
-    let d = quad_sdf(pixel_pos, mask_bounds, mask_radii);
+    let d = quad_sdf_continuous(pixel_pos, mask_bounds, mask_radii);
     return 1.0 - smoothstep(-0.5, 0.5, d);
 }
 

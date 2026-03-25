@@ -5,15 +5,160 @@
 //! elements with uniform height.
 
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, Corners, Element, ElementId, Entity,
-    GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
-    IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
+    AnyElement, Animation, App, AvailableSpace, Bounds, ContentMask, Corners, Element, ElementId,
+    Entity, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity,
+    IntoElement, IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
     StyleRefinement, Styled, Window, point, size,
 };
+use scheduler::Instant;
 use smallvec::SmallVec;
-use std::{cell::RefCell, cmp, ops::Range, rc::Rc, usize};
+use std::{cell::RefCell, cmp, ops::Range, rc::Rc, time::Duration, usize};
 
 use super::ListHorizontalSizingBehavior;
+
+/// Configuration for animating list item insertions, removals, and moves.
+///
+/// Attach to a `UniformList` via `.animate()`. Then call the notification methods
+/// on [`UniformListScrollHandle`] when you mutate your data so the list knows
+/// what changed and can drive the animations.
+pub struct ListAnimation {
+    /// Animation applied to newly inserted items (fade in).
+    pub on_insert: Option<Animation>,
+    /// Animation applied to removed items (fade out ghost).
+    pub on_remove: Option<Animation>,
+    /// Animation applied to moved items (slide to new position).
+    pub on_move: Option<Animation>,
+}
+
+impl ListAnimation {
+    /// Create a new, empty list animation configuration.
+    pub fn new() -> Self {
+        Self {
+            on_insert: None,
+            on_remove: None,
+            on_move: None,
+        }
+    }
+
+    /// Set the animation for newly inserted items.
+    pub fn on_insert(mut self, animation: Animation) -> Self {
+        self.on_insert = Some(animation);
+        self
+    }
+
+    /// Set the animation for removed items (ghost fade-out).
+    pub fn on_remove(mut self, animation: Animation) -> Self {
+        self.on_remove = Some(animation);
+        self
+    }
+
+    /// Set the animation for items that moved to a new index.
+    pub fn on_move(mut self, animation: Animation) -> Self {
+        self.on_move = Some(animation);
+        self
+    }
+}
+
+/// Describes an item that was removed from the list, for ghost animation.
+/// Pass these to [`UniformListScrollHandle::notify_removed`] **before** you
+/// mutate your backing data so the list can display ghost items during the
+/// exit animation.
+pub struct RemovedItem {
+    /// The item's index in the list before removal.
+    pub index: usize,
+    /// A closure that renders the ghost element on each frame.
+    /// Must produce a fresh element each call (elements are arena-allocated
+    /// and cannot survive across frames).
+    pub render: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+}
+
+/// Queued in the scroll handle by notify_* calls, consumed during prepaint.
+pub(crate) enum ListAnimationEvent {
+    Inserted {
+        range: Range<usize>,
+    },
+    Removed {
+        removals: Vec<RemovedItem>,
+    },
+    Moved {
+        /// Each tuple is (from_index, to_index).
+        moves: Vec<(usize, usize)>,
+    },
+}
+
+/// The kind of animation being applied to an item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnimationKind {
+    Insert,
+    Remove,
+    Move,
+}
+
+/// Per-item animation tracked across frames.
+struct ActiveItemAnimation {
+    kind: AnimationKind,
+    start: Instant,
+    duration: Duration,
+    easing: std::rc::Rc<dyn Fn(f32) -> f32>,
+    /// For Insert: the index of the inserted item.
+    /// For Move: the old index before the move.
+    from_index: usize,
+    /// For Insert: same as from_index.
+    /// For Move: the new index after the move.
+    to_index: usize,
+}
+
+impl ActiveItemAnimation {
+    /// Compute the eased animation delta [0.0, 1.0].
+    /// Returns `None` if the animation has completed.
+    fn delta(&self) -> Option<f32> {
+        let elapsed = self.start.elapsed().as_secs_f32();
+        let duration = self.duration.as_secs_f32();
+        if duration <= 0.0 {
+            return None;
+        }
+        let raw_delta = elapsed / duration;
+        if raw_delta >= 1.0 {
+            return None;
+        }
+        Some((self.easing)(raw_delta))
+    }
+}
+
+/// A removed item still being rendered during its exit animation.
+struct GhostItem {
+    /// The item's index before removal (used for positioning).
+    original_index: usize,
+    start: Instant,
+    duration: Duration,
+    easing: std::rc::Rc<dyn Fn(f32) -> f32>,
+    /// Closure to render the ghost element on each frame.
+    render: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+}
+
+impl GhostItem {
+    /// Compute the eased animation delta [0.0, 1.0].
+    /// Returns `None` if the animation has completed.
+    fn delta(&self) -> Option<f32> {
+        let elapsed = self.start.elapsed().as_secs_f32();
+        let duration = self.duration.as_secs_f32();
+        if duration <= 0.0 {
+            return None;
+        }
+        let raw_delta = elapsed / duration;
+        if raw_delta >= 1.0 {
+            return None;
+        }
+        Some((self.easing)(raw_delta))
+    }
+}
+
+/// Animation state persisted across frames in the scroll handle.
+#[derive(Default)]
+pub(crate) struct UniformListAnimationState {
+    active: Vec<ActiveItemAnimation>,
+    ghosts: Vec<GhostItem>,
+}
 
 /// uniform_list provides lazy rendering for a set of items that are of uniform height.
 /// When rendered into a container with overflow-y: hidden and a fixed (or max) height,
@@ -51,6 +196,7 @@ where
         scroll_handle: None,
         sizing_behavior: ListSizingBehavior::default(),
         horizontal_sizing_behavior: ListHorizontalSizingBehavior::default(),
+        animation: None,
     }
 }
 
@@ -66,11 +212,14 @@ pub struct UniformList {
     scroll_handle: Option<UniformListScrollHandle>,
     sizing_behavior: ListSizingBehavior,
     horizontal_sizing_behavior: ListHorizontalSizingBehavior,
+    animation: Option<ListAnimation>,
 }
 
 /// Frame state used by the [UniformList].
 pub struct UniformListFrameState {
     items: SmallVec<[AnyElement; 32]>,
+    item_opacities: SmallVec<[f32; 32]>,
+    ghost_items: SmallVec<[(AnyElement, f32); 4]>,
     decorations: SmallVec<[AnyElement; 2]>,
 }
 
@@ -110,7 +259,6 @@ pub struct DeferredScrollToItem {
     pub scroll_strict: bool,
 }
 
-#[derive(Clone, Debug, Default)]
 #[allow(missing_docs)]
 pub struct UniformListScrollState {
     pub base_handle: ScrollHandle,
@@ -119,6 +267,38 @@ pub struct UniformListScrollState {
     pub last_item_size: Option<ItemSize>,
     /// Whether the list was vertically flipped during last layout.
     pub y_flipped: bool,
+    /// Pending animation events queued by notify_* calls, consumed during prepaint.
+    pub(crate) pending_animation_events: Vec<ListAnimationEvent>,
+    /// Active animation state, managed during prepaint.
+    pub(crate) animation_state: UniformListAnimationState,
+}
+
+impl Default for UniformListScrollState {
+    fn default() -> Self {
+        Self {
+            base_handle: ScrollHandle::default(),
+            deferred_scroll_to_item: None,
+            last_item_size: None,
+            y_flipped: false,
+            pending_animation_events: Vec::new(),
+            animation_state: UniformListAnimationState::default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for UniformListScrollState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UniformListScrollState")
+            .field("base_handle", &self.base_handle)
+            .field("deferred_scroll_to_item", &self.deferred_scroll_to_item)
+            .field("last_item_size", &self.last_item_size)
+            .field("y_flipped", &self.y_flipped)
+            .field(
+                "pending_animation_events",
+                &self.pending_animation_events.len(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -139,6 +319,8 @@ impl UniformListScrollHandle {
             deferred_scroll_to_item: None,
             last_item_size: None,
             y_flipped: false,
+            pending_animation_events: Vec::new(),
+            animation_state: UniformListAnimationState::default(),
         })))
     }
 
@@ -240,6 +422,35 @@ impl UniformListScrollHandle {
     pub fn scroll_to_bottom(&self) {
         self.scroll_to_item(usize::MAX, ScrollStrategy::Bottom);
     }
+
+    /// Notify the list that items were inserted at the given range.
+    /// Call this **after** you have inserted items into your backing data.
+    pub fn notify_inserted(&self, range: Range<usize>) {
+        self.0
+            .borrow_mut()
+            .pending_animation_events
+            .push(ListAnimationEvent::Inserted { range });
+    }
+
+    /// Notify the list that items will be removed.
+    /// Call this **before** you remove items from your backing data, providing
+    /// pre-rendered elements for ghost display during the exit animation.
+    pub fn notify_removed(&self, removals: Vec<RemovedItem>) {
+        self.0
+            .borrow_mut()
+            .pending_animation_events
+            .push(ListAnimationEvent::Removed { removals });
+    }
+
+    /// Notify the list that items were moved to new positions.
+    /// Each tuple is `(from_index, to_index)`.
+    /// Call this **after** you have reordered your backing data.
+    pub fn notify_moved(&self, moves: Vec<(usize, usize)>) {
+        self.0
+            .borrow_mut()
+            .pending_animation_events
+            .push(ListAnimationEvent::Moved { moves });
+    }
 }
 
 impl Styled for UniformList {
@@ -311,6 +522,8 @@ impl Element for UniformList {
             layout_id,
             UniformListFrameState {
                 items: SmallVec::new(),
+                item_opacities: SmallVec::new(),
+                ghost_items: SmallVec::new(),
                 decorations: SmallVec::new(),
             },
         )
@@ -477,12 +690,147 @@ impl Element for UniformList {
                         (self.render_items)(visible_range.clone(), window, cx)
                     };
 
+                    // --- Animation state processing ---
+                    let has_active_animations;
+
+                    if let (Some(animation_config), Some(scroll_handle)) =
+                        (&self.animation, &self.scroll_handle)
+                    {
+                        let mut handle = scroll_handle.0.borrow_mut();
+                        let pending: Vec<ListAnimationEvent> =
+                            handle.pending_animation_events.drain(..).collect();
+                        let state = &mut handle.animation_state;
+
+                        // Cleanup expired animations
+                        state.active.retain(|a| a.delta().is_some());
+                        state.ghosts.retain(|g| g.delta().is_some());
+
+                        // Process new events
+                        let now = Instant::now();
+                        for event in pending {
+                            match event {
+                                ListAnimationEvent::Inserted { range } => {
+                                    if let Some(ref anim) = animation_config.on_insert {
+                                        for ix in range {
+                                            state.active.push(ActiveItemAnimation {
+                                                kind: AnimationKind::Insert,
+                                                start: now,
+                                                duration: anim.duration,
+                                                easing: anim.easing.clone(),
+                                                from_index: ix,
+                                                to_index: ix,
+                                            });
+                                        }
+                                    }
+                                }
+                                ListAnimationEvent::Removed { removals } => {
+                                    if let Some(ref anim) = animation_config.on_remove {
+                                        for removal in removals {
+                                            state.ghosts.push(GhostItem {
+                                                original_index: removal.index,
+                                                start: now,
+                                                duration: anim.duration,
+                                                easing: anim.easing.clone(),
+                                                render: removal.render,
+                                            });
+                                        }
+                                    }
+                                }
+                                ListAnimationEvent::Moved { moves } => {
+                                    if let Some(ref anim) = animation_config.on_move {
+                                        for (from, to) in moves {
+                                            state.active.push(ActiveItemAnimation {
+                                                kind: AnimationKind::Move,
+                                                start: now,
+                                                duration: anim.duration,
+                                                easing: anim.easing.clone(),
+                                                from_index: from,
+                                                to_index: to,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        has_active_animations =
+                            !state.active.is_empty() || !state.ghosts.is_empty();
+                    } else {
+                        has_active_animations = false;
+                    }
+
+                    // Pre-compute per-item animation values and ghost metadata.
+                    let mut item_anim_values: SmallVec<[(Pixels, f32); 32]> = SmallVec::new();
+                    // (original_index, opacity, ghost_index_in_state)
+                    let mut ghost_meta: SmallVec<[(usize, f32); 4]> = SmallVec::new();
+
+                    if has_active_animations {
+                        if let Some(scroll_handle) = &self.scroll_handle {
+                            let handle = scroll_handle.0.borrow();
+                            let state = &handle.animation_state;
+
+                            // Compute per-item y-offset and opacity
+                            for ix in visible_range.clone() {
+                                item_anim_values.push(
+                                    compute_item_animation(ix, state, item_height),
+                                );
+                            }
+
+                            // Collect ghost metadata (index + opacity)
+                            for ghost in &state.ghosts {
+                                if let Some(delta) = ghost.delta() {
+                                    ghost_meta.push((
+                                        ghost.original_index,
+                                        1.0 - delta,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    // Collect ghost render closures (Rc-cloned) so we can call
+                    // them without holding the scroll handle borrow.
+                    let mut ghost_renders: SmallVec<
+                        [(usize, f32, Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>); 4],
+                    > = SmallVec::new();
+                    if !ghost_meta.is_empty() {
+                        if let Some(scroll_handle) = &self.scroll_handle {
+                            let handle = scroll_handle.0.borrow();
+                            for (i, &(original_index, ghost_opacity)) in
+                                ghost_meta.iter().enumerate()
+                            {
+                                if let Some(ghost) = handle.animation_state.ghosts.get(i) {
+                                    ghost_renders.push((
+                                        original_index,
+                                        ghost_opacity,
+                                        ghost.render.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    // Render ghost elements (outside the borrow).
+                    let mut ghost_prepaint_data: SmallVec<[(usize, f32, AnyElement); 4]> =
+                        SmallVec::new();
+                    for (original_index, ghost_opacity, render) in ghost_renders {
+                        let element = render(window, cx);
+                        ghost_prepaint_data.push((original_index, ghost_opacity, element));
+                    }
+
                     let content_mask = ContentMask { bounds, corner_radii: Corners::default() };
                     window.with_content_mask(Some(content_mask), |window| {
-                        for (mut item, ix) in items.into_iter().zip(visible_range.clone()) {
+                        for (i, (mut item, ix)) in
+                            items.into_iter().zip(visible_range.clone()).enumerate()
+                        {
+                            let (anim_y_offset, anim_opacity) = item_anim_values
+                                .get(i)
+                                .copied()
+                                .unwrap_or((Pixels::ZERO, 1.0));
+
                             let item_origin = padded_bounds.origin
                                 + scroll_offset
-                                + point(Pixels::ZERO, item_height * ix);
+                                + point(Pixels::ZERO, item_height * ix + anim_y_offset);
 
                             let available_width = if can_scroll_horizontally {
                                 padded_bounds.size.width + scroll_offset.x.abs()
@@ -496,6 +844,27 @@ impl Element for UniformList {
                             item.layout_as_root(available_space, window, cx);
                             item.prepaint_at(item_origin, window, cx);
                             frame_state.items.push(item);
+                            frame_state.item_opacities.push(anim_opacity);
+                        }
+
+                        // Prepaint ghost items (removed items still animating out)
+                        for (original_index, ghost_opacity, mut element) in ghost_prepaint_data {
+                            let ghost_origin = padded_bounds.origin
+                                + scroll_offset
+                                + point(Pixels::ZERO, item_height * original_index);
+
+                            let available_width = if can_scroll_horizontally {
+                                padded_bounds.size.width + scroll_offset.x.abs()
+                            } else {
+                                padded_bounds.size.width
+                            };
+                            let available_space = size(
+                                AvailableSpace::Definite(available_width),
+                                AvailableSpace::Definite(item_height),
+                            );
+                            element.layout_as_root(available_space, window, cx);
+                            element.prepaint_at(ghost_origin, window, cx);
+                            frame_state.ghost_items.push((element, ghost_opacity));
                         }
 
                         let bounds =
@@ -519,6 +888,11 @@ impl Element for UniformList {
                             frame_state.decorations.push(decoration);
                         }
                     });
+
+                    // Request next animation frame if animations are still active
+                    if has_active_animations {
+                        window.request_animation_frame();
+                    }
                 }
 
                 hitbox
@@ -544,8 +918,27 @@ impl Element for UniformList {
             window,
             cx,
             |_, window, cx| {
-                for item in &mut request_layout.items {
-                    item.paint(window, cx);
+                let has_opacities = !request_layout.item_opacities.is_empty();
+                for (i, item) in request_layout.items.iter_mut().enumerate() {
+                    let opacity = if has_opacities {
+                        request_layout.item_opacities.get(i).copied()
+                    } else {
+                        None
+                    };
+                    // Only wrap with opacity if it's not fully opaque
+                    if opacity.map_or(false, |o| o < 1.0) {
+                        window.with_element_opacity(opacity, |window| {
+                            item.paint(window, cx);
+                        });
+                    } else {
+                        item.paint(window, cx);
+                    }
+                }
+                // Paint ghost items with their opacity
+                for (ghost, ghost_opacity) in &mut request_layout.ghost_items {
+                    window.with_element_opacity(Some(*ghost_opacity), |window| {
+                        ghost.paint(window, cx);
+                    });
                 }
                 for decoration in &mut request_layout.decorations {
                     decoration.paint(window, cx);
@@ -553,6 +946,51 @@ impl Element for UniformList {
             },
         )
     }
+}
+
+/// Compute the y-offset and opacity for a given item index based on active animations.
+fn compute_item_animation(
+    ix: usize,
+    state: &UniformListAnimationState,
+    item_height: Pixels,
+) -> (Pixels, f32) {
+    let mut y_offset = Pixels::ZERO;
+    let mut opacity = 1.0_f32;
+
+    for anim in &state.active {
+        match anim.kind {
+            AnimationKind::Insert => {
+                if let Some(delta) = anim.delta() {
+                    if ix == anim.from_index {
+                        // The inserted item itself: fade in
+                        opacity = opacity.min(delta);
+                    }
+                    // Items at or after the insertion point slide down
+                    // (they were displaced by the insertion)
+                    // Not applied here — displacement is visual only if
+                    // we tracked how many items were inserted in a batch.
+                    // For now, just fade in the inserted item.
+                }
+            }
+            AnimationKind::Move => {
+                if let Some(delta) = anim.delta() {
+                    if ix == anim.to_index {
+                        // This item moved from from_index to to_index.
+                        // Animate from old position to new position.
+                        let from_y = item_height * anim.from_index;
+                        let to_y = item_height * anim.to_index;
+                        let offset = (from_y - to_y) * (1.0 - delta);
+                        y_offset = y_offset + offset;
+                    }
+                }
+            }
+            AnimationKind::Remove => {
+                // Removals are handled via ghost items, not active animations
+            }
+        }
+    }
+
+    (y_offset, opacity)
 }
 
 impl IntoElement for UniformList {
@@ -665,6 +1103,16 @@ impl UniformList {
             AvailableSpace::MinContent,
         );
         item_to_measure.layout_as_root(available_space, window, cx)
+    }
+
+    /// Enable animations for list item insertions, removals, and/or moves.
+    ///
+    /// When set, the list will animate items based on notifications sent via
+    /// the [`UniformListScrollHandle`] methods `notify_inserted`, `notify_removed`,
+    /// and `notify_moved`.
+    pub fn animate(mut self, animation: ListAnimation) -> Self {
+        self.animation = Some(animation);
+        self
     }
 
     /// Track and render scroll state of this list with reference to the given scroll handle.

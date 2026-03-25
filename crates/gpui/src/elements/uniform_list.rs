@@ -620,6 +620,8 @@ impl Element for UniformList {
                         scroll_strict,
                     }) = shared_scroll_to_item
                     {
+                        let max_item_index = self.item_count.saturating_sub(1);
+                        item_index = item_index.min(max_item_index);
                         if y_flipped {
                             item_index = self.item_count.saturating_sub(item_index + 1);
                         }

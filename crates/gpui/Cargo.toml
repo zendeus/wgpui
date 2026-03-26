@@ -220,6 +220,10 @@ name = "animated_list"
 path = "examples/animated_list.rs"
 
 [[example]]
+name = "animated_variable_list"
+path = "examples/animated_variable_list.rs"
+
+[[example]]
 name = "window_shadow"
 path = "examples/window_shadow.rs"
 

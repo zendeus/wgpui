@@ -10,12 +10,13 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Corners, DispatchPhase, Edges, Element,
     EntityId, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
-    IntoElement, Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style,
-    StyleRefinement, Styled, Window, point, px, size,
+    IntoElement, ListAnimation, Overflow, Pixels, Point, RemovedItem, ScrollDelta,
+    ScrollWheelEvent, Size, Style, StyleRefinement, Styled, Window, point, px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use scheduler::Instant;
+use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
@@ -72,6 +73,8 @@ struct StateInner {
     scrollbar_drag_start_height: Option<Pixels>,
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScrollFraction>,
+    animation_config: Option<ListAnimation>,
+    animation_state: ListAnimationState,
 }
 
 /// Keeps track of a fractional scroll position within an item for restoration
@@ -148,6 +151,9 @@ struct LayoutItemsResponse {
     max_item_width: Pixels,
     scroll_top: ListOffset,
     item_layouts: VecDeque<ItemLayout>,
+    item_anim_values: Vec<(Pixels, f32)>,
+    ghost_items: Vec<(AnyElement, f32)>,
+    has_active_animations: bool,
 }
 
 struct ItemLayout {
@@ -216,6 +222,121 @@ struct Count(usize);
 #[derive(Clone, Debug, Default)]
 struct Height(Pixels);
 
+// --- List animation types ---
+
+/// Per-item animation tracked across frames (pixel-based for variable heights).
+struct ListActiveItemAnimation {
+    kind: ListAnimationKind,
+    start: Instant,
+    duration: Duration,
+    easing: Rc<dyn Fn(f32) -> f32>,
+    target_index: usize,
+    from_pixel_y: Pixels,
+    to_pixel_y: Pixels,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListAnimationKind {
+    Insert,
+    Move,
+}
+
+impl ListActiveItemAnimation {
+    fn delta(&self) -> Option<f32> {
+        let elapsed = self.start.elapsed().as_secs_f32();
+        let duration = self.duration.as_secs_f32();
+        if duration <= 0.0 {
+            return None;
+        }
+        let raw_delta = elapsed / duration;
+        if raw_delta >= 1.0 {
+            return None;
+        }
+        Some((self.easing)(raw_delta))
+    }
+}
+
+/// A removed item still rendering during its exit animation.
+struct ListGhostItem {
+    pixel_y: Pixels,
+    height: Pixels,
+    start: Instant,
+    duration: Duration,
+    easing: Rc<dyn Fn(f32) -> f32>,
+    render: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+}
+
+impl ListGhostItem {
+    fn delta(&self) -> Option<f32> {
+        let elapsed = self.start.elapsed().as_secs_f32();
+        let duration = self.duration.as_secs_f32();
+        if duration <= 0.0 {
+            return None;
+        }
+        let raw_delta = elapsed / duration;
+        if raw_delta >= 1.0 {
+            return None;
+        }
+        Some((self.easing)(raw_delta))
+    }
+}
+
+/// Internal enriched animation event with captured pixel positions.
+enum ListInternalAnimationEvent {
+    Inserted {
+        range: Range<usize>,
+    },
+    Removed {
+        items: Vec<ListRemovedItemData>,
+    },
+    Moved {
+        items: Vec<ListMoveData>,
+    },
+}
+
+struct ListRemovedItemData {
+    pixel_y: Pixels,
+    height: Pixels,
+    render: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+}
+
+struct ListMoveData {
+    to_index: usize,
+    from_pixel_y: Pixels,
+}
+
+/// Animation state persisted across frames in StateInner.
+#[derive(Default)]
+struct ListAnimationState {
+    active: Vec<ListActiveItemAnimation>,
+    ghosts: Vec<ListGhostItem>,
+    pending_events: Vec<ListInternalAnimationEvent>,
+}
+
+fn compute_list_item_animation(ix: usize, state: &ListAnimationState) -> (Pixels, f32) {
+    let mut y_offset = px(0.);
+    let mut opacity = 1.0_f32;
+
+    for anim in &state.active {
+        if ix != anim.target_index {
+            continue;
+        }
+        if let Some(delta) = anim.delta() {
+            match anim.kind {
+                ListAnimationKind::Insert => {
+                    opacity = opacity.min(delta);
+                }
+                ListAnimationKind::Move => {
+                    let offset = (anim.from_pixel_y - anim.to_pixel_y) * (1.0 - delta);
+                    y_offset = y_offset + offset;
+                }
+            }
+        }
+    }
+
+    (y_offset, opacity)
+}
+
 impl ListState {
     /// Construct a new list state, for storage on a view.
     ///
@@ -236,6 +357,8 @@ impl ListState {
             scrollbar_drag_start_height: None,
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
+            animation_config: None,
+            animation_state: ListAnimationState::default(),
         })));
         this.splice(0..0, item_count);
         this
@@ -259,6 +382,9 @@ impl ListState {
             state.measuring_behavior.reset();
             state.logical_scroll_top = None;
             state.scrollbar_drag_start_height = None;
+            state.animation_state.active.clear();
+            state.animation_state.ghosts.clear();
+            state.animation_state.pending_events.clear();
             state.items.summary().count
         };
 
@@ -522,6 +648,81 @@ impl ListState {
     /// Return the bounds of the viewport in pixels.
     pub fn viewport_bounds(&self) -> Bounds<Pixels> {
         self.0.borrow().last_layout_bounds.unwrap_or_default()
+    }
+
+    /// Enable insert/remove/move animations for this list.
+    pub fn animate(&self, animation: ListAnimation) {
+        self.0.borrow_mut().animation_config = Some(animation);
+    }
+
+    /// Notify that items were inserted. Call **after** `splice()`.
+    pub fn notify_inserted(&self, range: Range<usize>) {
+        let mut state = self.0.borrow_mut();
+        if state.animation_config.is_none() {
+            return;
+        }
+        state
+            .animation_state
+            .pending_events
+            .push(ListInternalAnimationEvent::Inserted { range });
+    }
+
+    /// Notify that items will be removed. Call **before** `splice()` so that
+    /// pixel positions and heights can be captured from the SumTree.
+    pub fn notify_removed(&self, removals: Vec<RemovedItem>) {
+        let mut state = self.0.borrow_mut();
+        if state.animation_config.is_none() {
+            return;
+        }
+        let items: Vec<_> = removals
+            .into_iter()
+            .map(|removal| {
+                let mut cursor = state.items.cursor::<ListItemSummary>(());
+                cursor.seek(&Count(removal.index), Bias::Right);
+                let pixel_y = cursor.start().height;
+                let height = cursor
+                    .item()
+                    .and_then(|item| item.size())
+                    .map(|s| s.height)
+                    .unwrap_or(px(0.));
+                ListRemovedItemData {
+                    pixel_y,
+                    height,
+                    render: removal.render,
+                }
+            })
+            .collect();
+        state
+            .animation_state
+            .pending_events
+            .push(ListInternalAnimationEvent::Removed { items });
+    }
+
+    /// Notify that items were moved. Pass `(from_index, to_index)` pairs.
+    /// Call **before** the actual reorder so that `from` pixel positions can be
+    /// captured. The `to` positions are looked up during prepaint after the
+    /// SumTree has been mutated.
+    pub fn notify_moved(&self, moves: Vec<(usize, usize)>) {
+        let mut state = self.0.borrow_mut();
+        if state.animation_config.is_none() {
+            return;
+        }
+        let items: Vec<_> = moves
+            .into_iter()
+            .map(|(from, to)| {
+                let mut cursor = state.items.cursor::<ListItemSummary>(());
+                cursor.seek(&Count(from), Bias::Right);
+                let from_pixel_y = cursor.start().height;
+                ListMoveData {
+                    to_index: to,
+                    from_pixel_y,
+                }
+            })
+            .collect();
+        state
+            .animation_state
+            .pending_events
+            .push(ListInternalAnimationEvent::Moved { items });
     }
 }
 
@@ -843,6 +1044,74 @@ impl StateInner {
             max_item_width,
             scroll_top,
             item_layouts,
+            item_anim_values: Vec::new(),
+            ghost_items: Vec::new(),
+            has_active_animations: false,
+        }
+    }
+
+    fn process_animation_events(&mut self) {
+        let config = match &self.animation_config {
+            Some(c) => c,
+            None => return,
+        };
+
+        let pending: Vec<_> = self.animation_state.pending_events.drain(..).collect();
+        self.animation_state.active.retain(|a| a.delta().is_some());
+        self.animation_state.ghosts.retain(|g| g.delta().is_some());
+
+        let now = Instant::now();
+        for event in pending {
+            match event {
+                ListInternalAnimationEvent::Inserted { range } => {
+                    if let Some(ref anim) = config.on_insert {
+                        for ix in range {
+                            self.animation_state.active.push(ListActiveItemAnimation {
+                                kind: ListAnimationKind::Insert,
+                                start: now,
+                                duration: anim.duration,
+                                easing: anim.easing.clone(),
+                                target_index: ix,
+                                from_pixel_y: px(0.),
+                                to_pixel_y: px(0.),
+                            });
+                        }
+                    }
+                }
+                ListInternalAnimationEvent::Removed { items } => {
+                    if let Some(ref anim) = config.on_remove {
+                        for item in items {
+                            self.animation_state.ghosts.push(ListGhostItem {
+                                pixel_y: item.pixel_y,
+                                height: item.height,
+                                start: now,
+                                duration: anim.duration,
+                                easing: anim.easing.clone(),
+                                render: item.render,
+                            });
+                        }
+                    }
+                }
+                ListInternalAnimationEvent::Moved { items } => {
+                    if let Some(ref anim) = config.on_move {
+                        for move_data in items {
+                            let mut cursor = self.items.cursor::<ListItemSummary>(());
+                            cursor.seek(&Count(move_data.to_index), Bias::Right);
+                            let to_pixel_y = cursor.start().height;
+
+                            self.animation_state.active.push(ListActiveItemAnimation {
+                                kind: ListAnimationKind::Move,
+                                start: now,
+                                duration: anim.duration,
+                                easing: anim.easing.clone(),
+                                target_index: move_data.to_index,
+                                from_pixel_y: move_data.from_pixel_y,
+                                to_pixel_y,
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -872,6 +1141,23 @@ impl StateInner {
                 cx,
             );
 
+            // Process animation events after layout (SumTree is up to date)
+            self.process_animation_events();
+
+            // Compute per-item animation values
+            if self.animation_config.is_some() {
+                for item in &layout_response.item_layouts {
+                    layout_response
+                        .item_anim_values
+                        .push(compute_list_item_animation(
+                            item.index,
+                            &self.animation_state,
+                        ));
+                }
+                layout_response.has_active_animations = !self.animation_state.active.is_empty()
+                    || !self.animation_state.ghosts.is_empty();
+            }
+
             // Avoid honoring autoscroll requests from elements other than our children.
             window.take_autoscroll();
 
@@ -879,9 +1165,17 @@ impl StateInner {
             if bounds.size.height > padding.top + padding.bottom {
                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
-                for item in &mut layout_response.item_layouts {
+                for (i, item) in layout_response.item_layouts.iter_mut().enumerate() {
+                    let anim_y_offset = layout_response
+                        .item_anim_values
+                        .get(i)
+                        .map(|(y, _)| *y)
+                        .unwrap_or(px(0.));
+                    let adjusted_origin =
+                        Point::new(item_origin.x, item_origin.y + anim_y_offset);
+
                     window.with_content_mask(Some(ContentMask { bounds, corner_radii: Corners::default() }), |window| {
-                        item.element.prepaint_at(item_origin, window, cx);
+                        item.element.prepaint_at(adjusted_origin, window, cx);
                     });
 
                     if let Some(autoscroll_bounds) = window.take_autoscroll()
@@ -926,6 +1220,57 @@ impl StateInner {
                     }
 
                     item_origin.y += item.size.height;
+                }
+
+                // Render ghost items for removal animations
+                if self.animation_config.is_some() {
+                    // Compute scroll pixel offset for ghost positioning
+                    let mut scroll_cursor = self.items.cursor::<ListItemSummary>(());
+                    scroll_cursor.seek(
+                        &Count(layout_response.scroll_top.item_ix),
+                        Bias::Right,
+                    );
+                    let scroll_pixel_offset = scroll_cursor.start().height
+                        + layout_response.scroll_top.offset_in_item;
+
+                    let ghosts_to_render: Vec<_> = self
+                        .animation_state
+                        .ghosts
+                        .iter()
+                        .filter_map(|ghost| {
+                            ghost.delta().map(|delta| {
+                                (
+                                    ghost.pixel_y,
+                                    ghost.height,
+                                    1.0 - delta,
+                                    ghost.render.clone(),
+                                )
+                            })
+                        })
+                        .collect();
+
+                    for (pixel_y, height, opacity, render) in ghosts_to_render {
+                        let mut element = render(window, cx);
+                        let available_space = size(
+                            AvailableSpace::Definite(bounds.size.width),
+                            AvailableSpace::Definite(height),
+                        );
+                        element.layout_as_root(available_space, window, cx);
+
+                        let ghost_y =
+                            bounds.origin.y + padding.top + pixel_y - scroll_pixel_offset;
+                        let ghost_origin = Point::new(bounds.origin.x, ghost_y);
+                        window.with_content_mask(
+                            Some(ContentMask {
+                                bounds,
+                                corner_radii: Corners::default(),
+                            }),
+                            |window| {
+                                element.prepaint_at(ghost_origin, window, cx);
+                            },
+                        );
+                        layout_response.ghost_items.push((element, opacity));
+                    }
                 }
             } else {
                 layout_response.item_layouts.clear();
@@ -1120,6 +1465,10 @@ impl Element for List {
                 }
             };
 
+        if layout.has_active_animations {
+            window.request_animation_frame();
+        }
+
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
         ListPrepaintState { hitbox, layout }
@@ -1137,8 +1486,25 @@ impl Element for List {
     ) {
         let current_view = window.current_view();
         window.with_content_mask(Some(ContentMask { bounds, corner_radii: Corners::default() }), |window| {
-            for item in &mut prepaint.layout.item_layouts {
-                item.element.paint(window, cx);
+            let has_anim = !prepaint.layout.item_anim_values.is_empty();
+            for (i, item) in prepaint.layout.item_layouts.iter_mut().enumerate() {
+                let opacity = if has_anim {
+                    prepaint.layout.item_anim_values.get(i).map(|(_, o)| *o)
+                } else {
+                    None
+                };
+                if opacity.is_some_and(|o| o < 1.0) {
+                    window.with_element_opacity(opacity, |window| {
+                        item.element.paint(window, cx);
+                    });
+                } else {
+                    item.element.paint(window, cx);
+                }
+            }
+            for (ghost, ghost_opacity) in &mut prepaint.layout.ghost_items {
+                window.with_element_opacity(Some(*ghost_opacity), |window| {
+                    ghost.paint(window, cx);
+                });
             }
         });
 

@@ -46,38 +46,24 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 }
 
 // Inline SDF for rounded rect clipping (standalone shader, no access to shaders.wgsl functions)
-fn pick_corner_radius_composite(center_to_point: vec2<f32>, radii: vec4<f32>) -> f32 {
-    // radii: (top_left, top_right, bottom_right, bottom_left)
-    if (center_to_point.x < 0.0) {
-        if (center_to_point.y < 0.0) {
-            return radii.x; // top_left
-        } else {
-            return radii.w; // bottom_left
-        }
-    } else {
-        if (center_to_point.y < 0.0) {
-            return radii.y; // top_right
-        } else {
-            return radii.z; // bottom_right
-        }
-    }
+// Uses continuous multi-corner approach to avoid discontinuities with asymmetric radii.
+fn corner_sdf_composite(p: vec2<f32>, half_size: vec2<f32>, radius: f32) -> f32 {
+    let q = p - half_size + radius;
+    return length(max(vec2<f32>(0.0), q)) + min(0.0, max(q.x, q.y)) - radius;
 }
 
 fn rounded_rect_sdf(point: vec2<f32>, origin: vec2<f32>, size: vec2<f32>, radii: vec4<f32>) -> f32 {
+    // radii: (top_left, top_right, bottom_right, bottom_left)
     let half_size = size / 2.0;
     let center = origin + half_size;
-    let center_to_point = point - center;
-    let corner_radius = pick_corner_radius_composite(center_to_point, radii);
-    let corner_to_point = abs(center_to_point) - half_size;
-    let corner_center_to_point = corner_to_point + corner_radius;
-    if (corner_radius == 0.0) {
-        return max(corner_center_to_point.x, corner_center_to_point.y);
-    } else {
-        let signed_distance =
-            length(max(vec2<f32>(0.0), corner_center_to_point)) +
-            min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
-        return signed_distance - corner_radius;
-    }
+    let p = point - center;
+
+    let d_tl = corner_sdf_composite(vec2<f32>(-p.x, -p.y), half_size, radii.x);
+    let d_tr = corner_sdf_composite(vec2<f32>( p.x, -p.y), half_size, radii.y);
+    let d_br = corner_sdf_composite(vec2<f32>( p.x,  p.y), half_size, radii.z);
+    let d_bl = corner_sdf_composite(vec2<f32>(-p.x,  p.y), half_size, radii.w);
+
+    return max(max(d_tl, d_tr), max(d_br, d_bl));
 }
 
 @fragment

@@ -1496,32 +1496,23 @@ impl ContentMask<Pixels> {
     /// incorrectly applied to children that are inset from the parent's corners.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        let max_radius_x = bounds.size.width * 0.5;
-        let max_radius_y = bounds.size.height * 0.5;
-        let max_radius = Pixels(max_radius_x.0.min(max_radius_y.0));
 
-        // Adjust a corner radius based on how far the intersection is inset from the
-        // original mask's corner. The radius shrinks by the inset distance, reaching
-        // zero when the intersection is fully past the rounded area.
-        let adjust = |radius: Pixels, inset_a: Pixels, inset_b: Pixels| -> Pixels {
-            let inset = inset_a.0.max(inset_b.0);
+        // Adjust each mask's corner radius based on how far the intersection is
+        // inset from that mask's corner. This follows the CSS "inner radius" rule:
+        // effective_radius = max(0, radius - inset). When a corner is fully past
+        // the rounded area, its radius becomes zero (straight edge).
+        //
+        // This handles two cases correctly:
+        // 1. Parent radii don't propagate to inset children (parent's radii reduce
+        //    to zero when the child is far from the parent's corners).
+        // 2. When a rounded element is clipped by a viewport, the clipped edge
+        //    gets zero radii (straight line) while the visible edge keeps its
+        //    curvature. The arc center of the remaining radii coincides with the
+        //    original circle center, so the clipped shape is geometrically exact.
+        let adjust = |radius: Pixels, inset_x: Pixels, inset_y: Pixels| -> Pixels {
+            let inset = inset_x.0.max(inset_y.0);
             Pixels((radius.0 - inset).max(0.0))
         };
-
-        // For each corner, compute the adjusted radius from both masks, then take
-        // the larger (tighter clip), clamped to half the intersection size.
-        let merge_corner =
-            |r_self: Pixels,
-             r_other: Pixels,
-             self_inset_x: Pixels,
-             self_inset_y: Pixels,
-             other_inset_x: Pixels,
-             other_inset_y: Pixels|
-             -> Pixels {
-                let adj_self = adjust(r_self, self_inset_x, self_inset_y);
-                let adj_other = adjust(r_other, other_inset_x, other_inset_y);
-                Pixels(adj_self.0.max(adj_other.0).min(max_radius.0))
-            };
 
         // Insets from each mask's bounds to the intersection bounds, per edge.
         let self_inset_left = bounds.origin.x - self.bounds.origin.x;
@@ -1537,6 +1528,22 @@ impl ContentMask<Pixels> {
             other.bounds.bottom_right().x - bounds.bottom_right().x;
         let other_inset_bottom =
             other.bounds.bottom_right().y - bounds.bottom_right().y;
+
+        // For each corner, adjust both masks' radii by their respective insets,
+        // then take the larger (tighter clip). No max_radius clamping — the
+        // shader's SDF handles radii exceeding half the bounds gracefully.
+        let merge_corner =
+            |r_self: Pixels,
+             r_other: Pixels,
+             self_inset_x: Pixels,
+             self_inset_y: Pixels,
+             other_inset_x: Pixels,
+             other_inset_y: Pixels|
+             -> Pixels {
+                let adj_self = adjust(r_self, self_inset_x, self_inset_y);
+                let adj_other = adjust(r_other, other_inset_x, other_inset_y);
+                Pixels(adj_self.0.max(adj_other.0))
+            };
 
         let corner_radii = Corners {
             top_left: merge_corner(

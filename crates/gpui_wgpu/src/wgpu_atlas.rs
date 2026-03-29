@@ -315,7 +315,7 @@ impl WgpuAtlasTexture {
         let tile = AtlasTile {
             texture_id: self.id,
             tile_id: allocation.id.into(),
-            padding: 0,
+            padding: 1,
             bounds: Bounds {
                 origin: etagere_point_to_device(allocation.rectangle.min),
                 size,

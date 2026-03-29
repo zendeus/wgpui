@@ -120,7 +120,8 @@ impl WgpuContext {
             .features()
             .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
 
-        let mut required_features = wgpu::Features::empty();
+        let mut required_features = wgpu::Features::INDIRECT_FIRST_INSTANCE
+            | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
         if dual_source_blending {
             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
         } else {
@@ -152,9 +153,15 @@ impl WgpuContext {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("gpui_device"),
                 required_features,
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits())
-                    .using_alignment(adapter.limits()),
+                required_limits: {
+                    let mut limits = wgpu::Limits::downlevel_defaults()
+                        .using_resolution(adapter.limits())
+                        .using_alignment(adapter.limits());
+                    // Raise storage buffer limit for compute shaders that need more bindings.
+                    limits.max_storage_buffers_per_shader_stage =
+                        limits.max_storage_buffers_per_shader_stage.max(8);
+                    limits
+                },
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),

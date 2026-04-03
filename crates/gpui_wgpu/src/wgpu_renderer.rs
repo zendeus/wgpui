@@ -1305,7 +1305,7 @@ impl WgpuRenderer {
                             drop(pass);
 
                             // Run user callbacks to fill offscreen textures
-                            self.run_gpu_canvas_callbacks(canvases, canvas_offset);
+                            self.run_gpu_canvas_callbacks(canvases, canvas_offset, scene.scale_factor);
 
                             // Composite offscreen textures back onto the frame
                             {
@@ -1788,7 +1788,7 @@ impl WgpuRenderer {
     }
 
     /// Create or reuse offscreen textures and invoke user callbacks for each gpu_canvas.
-    fn run_gpu_canvas_callbacks(&mut self, canvases: &[PaintGpuCanvas], offset: usize) {
+    fn run_gpu_canvas_callbacks(&mut self, canvases: &[PaintGpuCanvas], offset: usize, scale_factor: f32) {
         let device = Arc::clone(&self.resources().device);
         let queue = Arc::clone(&self.resources().queue);
         let surface_format = self.surface_config.format;
@@ -1845,7 +1845,7 @@ impl WgpuRenderer {
                         width: DevicePixels(width as i32),
                         height: DevicePixels(height as i32),
                     },
-                    scale_factor: 1.0,
+                    scale_factor,
                     atlas: &self.atlas,
                 };
                 callback(&mut context);

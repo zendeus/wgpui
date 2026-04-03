@@ -24,7 +24,6 @@ pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
 
-#[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
@@ -39,6 +38,29 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     pub gpu_canvases: Vec<PaintGpuCanvas>,
+    /// Display scale factor (device pixels per logical pixel).
+    /// Used by gpu_canvas callbacks to correctly size rasterized content.
+    pub scale_factor: f32,
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Self {
+            paint_operations: Vec::new(),
+            primitive_bounds: BoundsTree::default(),
+            layer_stack: Vec::new(),
+            shadows: Vec::new(),
+            quads: Vec::new(),
+            paths: Vec::new(),
+            underlines: Vec::new(),
+            monochrome_sprites: Vec::new(),
+            subpixel_sprites: Vec::new(),
+            polychrome_sprites: Vec::new(),
+            surfaces: Vec::new(),
+            gpu_canvases: Vec::new(),
+            scale_factor: 1.0,
+        }
+    }
 }
 
 #[expect(missing_docs)]
